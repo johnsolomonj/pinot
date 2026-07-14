@@ -18,11 +18,11 @@
  */
 package org.apache.pinot.query.routing;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -40,6 +40,7 @@ import org.apache.pinot.calcite.rel.logical.PinotRelExchangeType;
 import org.apache.pinot.calcite.rel.rules.ImmutableTableOptions;
 import org.apache.pinot.calcite.rel.rules.TableOptions;
 import org.apache.pinot.common.request.BrokerRequest;
+import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.common.utils.config.QueryOptionsUtils;
 import org.apache.pinot.core.routing.LogicalTableRouteInfo;
 import org.apache.pinot.core.routing.LogicalTableRouteProvider;
@@ -111,20 +112,35 @@ public class WorkerManager {
     // worker instance with identical server/mailbox port number.
     DispatchablePlanMetadata metadata = context.getDispatchablePlanMetadataMap().get(0);
     metadata.setWorkerIdToServerInstanceMap(
-        Collections.singletonMap(0, new QueryServerInstance(_instanceId, _hostName, _port, _port)));
+        Map.of(0, new QueryServerInstance(_instanceId, _hostName, _port, _port)));
+
+    // Two-pass assignment: leaf stages must be assigned first so that the candidate server information
+    // (_nonLookupTables or _leafServerInstances) is fully populated before intermediate stages use it.
+    // Without this, literal-only stages (e.g. UNION ALL of constants) that are traversed before any table scan
+    // would see an empty candidate set and fall back to all enabled servers across all tenants.
     for (PlanFragment child : rootFragment.getChildren()) {
-      assignWorkersToNonRootFragment(child, context);
+      assignWorkersToNonRootFragment(child, context, true);
+    }
+    for (PlanFragment child : rootFragment.getChildren()) {
+      assignWorkersToNonRootFragment(child, context, false);
     }
   }
 
-  private void assignWorkersToNonRootFragment(PlanFragment fragment, DispatchablePlanContext context) {
+  /// Post-order traversal that assigns workers to either leaf or intermediate fragments.
+  /// @param leafOnly when true, only leaf fragments are assigned; when false, only intermediate fragments are assigned
+  private void assignWorkersToNonRootFragment(PlanFragment fragment, DispatchablePlanContext context,
+      boolean leafOnly) {
     List<PlanFragment> children = fragment.getChildren();
     for (PlanFragment child : children) {
-      assignWorkersToNonRootFragment(child, context);
+      assignWorkersToNonRootFragment(child, context, leafOnly);
     }
     Map<Integer, DispatchablePlanMetadata> metadataMap = context.getDispatchablePlanMetadataMap();
     DispatchablePlanMetadata metadata = metadataMap.get(fragment.getFragmentId());
-    if (isLeafPlan(metadata)) {
+    boolean isLeaf = isLeafPlan(metadata);
+    if (leafOnly != isLeaf) {
+      return;
+    }
+    if (isLeaf) {
       // TODO: Revisit this logic and see if we can generalize this
       // For LOOKUP join, join is leaf stage because there is no exchange added to the right side of the join. When we
       // find a single local exchange child in the leaf stage, assign workers based on the local exchange child.
@@ -134,7 +150,6 @@ public class WorkerManager {
         metadata.setWorkerIdToServerInstanceMap(workerIdToServerInstanceMap);
         metadata.setPartitionFunction(childMetadata.getPartitionFunction());
         // Fake a segments map so that the worker can be correctly identified as leaf stage
-        // TODO: Add a query test for LOOKUP join
         Map<String, List<String>> segmentsMap = Map.of(TableType.OFFLINE.name(), List.of());
         Map<Integer, Map<String, List<String>>> workerIdToSegmentsMap =
             Maps.newHashMapWithExpectedSize(workerIdToServerInstanceMap.size());
@@ -211,10 +226,11 @@ public class WorkerManager {
     DispatchablePlanMetadata metadata = metadataMap.get(fragment.getFragmentId());
 
     if (context.getTableNames().isEmpty()) {
-      // For constant expression query (no table is accessed), assign it to a random enabled server.
+      // For constant expression query (no table is accessed), assign it to a random routable server so we don't pick
+      // a server that's been excluded from routing by the FailureDetector.
       // TODO: Consider short-circuiting it and directly calculating the result on broker.
 
-      Collection<ServerInstance> serverInstances = _routingManager.getEnabledServerInstanceMap().values();
+      Collection<ServerInstance> serverInstances = _routingManager.getRoutableServerInstanceMap().values();
       int numServers = serverInstances.size();
       if (numServers == 0) {
         LOGGER.error("[RequestId: {}] No server instance found for constant expression query", context.getRequestId());
@@ -366,12 +382,13 @@ public class WorkerManager {
     if (context.isUseLeafServerForIntermediateStage()) {
       Set<QueryServerInstance> leafServerInstances = context.getLeafServerInstances();
       if (leafServerInstances.isEmpty()) {
-        // Fall back to use all enabled servers if no leaf server is found (e.g., when querying an empty table).
+        // Fall back to use all routable servers if no leaf server is found (e.g., when querying an empty table).
+        // Routable excludes servers removed from routing by the FailureDetector.
         LOGGER.warn("[RequestId: {}] No leaf server found with useLeafServerForIntermediateStage enabled, "
-            + "falling back to all enabled servers", context.getRequestId());
-        Map<String, ServerInstance> enabledServerInstanceMap = _routingManager.getEnabledServerInstanceMap();
-        candidateServers = new ArrayList<>(enabledServerInstanceMap.size());
-        for (ServerInstance serverInstance : enabledServerInstanceMap.values()) {
+            + "falling back to all routable servers", context.getRequestId());
+        Map<String, ServerInstance> routableServerInstanceMap = _routingManager.getRoutableServerInstanceMap();
+        candidateServers = new ArrayList<>(routableServerInstanceMap.size());
+        for (ServerInstance serverInstance : routableServerInstanceMap.values()) {
           candidateServers.add(new QueryServerInstance(serverInstance));
         }
         if (candidateServers.isEmpty()) {
@@ -411,21 +428,24 @@ public class WorkerManager {
         }
       }
     }
-    Map<String, ServerInstance> enabledServerInstanceMap = _routingManager.getEnabledServerInstanceMap();
+    // Use the routable server map so that FailureDetector-excluded servers are filtered out from both the fallback and
+    // the per-table lookup paths. The {@code servers} set is already filtered via per-table InstanceSelector, but the
+    // routable map narrows the fallback path too.
+    Map<String, ServerInstance> routableServerInstanceMap = _routingManager.getRoutableServerInstanceMap();
     List<QueryServerInstance> candidateServers;
     if (servers.isEmpty()) {
-      // Fall back to use all enabled servers if no server is found for the tables.
+      // Fall back to use all routable servers if no server is found for the tables.
       // TODO: Revisit if we should throw an exception instead.
       LOGGER.warn("[RequestId: {}] No server instance found for intermediate stage for tables: {}, "
-          + "falling back to all enabled servers", context.getRequestId(), nonLookupTables);
-      candidateServers = new ArrayList<>(enabledServerInstanceMap.size());
-      for (ServerInstance serverInstance : enabledServerInstanceMap.values()) {
+          + "falling back to all routable servers", context.getRequestId(), nonLookupTables);
+      candidateServers = new ArrayList<>(routableServerInstanceMap.size());
+      for (ServerInstance serverInstance : routableServerInstanceMap.values()) {
         candidateServers.add(new QueryServerInstance(serverInstance));
       }
     } else {
       candidateServers = new ArrayList<>(servers.size());
       for (String server : servers) {
-        ServerInstance serverInstance = enabledServerInstanceMap.get(server);
+        ServerInstance serverInstance = routableServerInstanceMap.get(server);
         if (serverInstance != null) {
           candidateServers.add(new QueryServerInstance(serverInstance));
         }
@@ -473,36 +493,64 @@ public class WorkerManager {
 
       String partitionKey = tableOptions.get(PinotHintOptions.TableHintOptions.PARTITION_KEY);
       if (partitionKey != null) {
-        assignWorkersToPartitionedLeafFragment(metadata, context, partitionKey, tableOptions);
-        addLeafServersToContext(metadata, context);
+        // Broker pruning: build a filter-bearing routing query (null when disabled/unsupported) so the partitioned
+        // assignment can drop partitions with no matching segments. Reuses the same gate as the non-partitioned path.
+        // Skip pre-partitioned leaves up front: pruning is disabled for them (see computePartitionsToKeep), so don't
+        // spend planning time building the routing query, e.g. for colocated-join leaves.
+        PinotQuery routingPinotQuery = metadata.isPrePartitioned() ? null
+            : extractRoutingQuery(fragment.getFragmentRoot(), metadata.getScannedTables().get(0), context);
+        assignWorkersToPartitionedLeafFragment(metadata, context, partitionKey, tableOptions, routingPinotQuery);
+        updateContextForLeafStage(metadata, context);
         return;
       }
     }
 
     if (metadata.getLogicalTableRouteInfo() != null) {
-      assignWorkersToNonPartitionedLeafFragmentForLogicalTable(metadata, context);
+      assignWorkersToNonPartitionedLeafFragmentForLogicalTable(fragment, metadata, context);
     } else {
-      assignWorkersToNonPartitionedLeafFragment(metadata, context);
+      assignWorkersToNonPartitionedLeafFragment(fragment, metadata, context);
     }
-    addLeafServersToContext(metadata, context);
+    updateContextForLeafStage(metadata, context);
   }
 
-  private void addLeafServersToContext(DispatchablePlanMetadata metadata, DispatchablePlanContext context) {
+  private void updateContextForLeafStage(DispatchablePlanMetadata metadata, DispatchablePlanContext context) {
+    filterLeafStageSegments(context, metadata);
     if (context.isUseLeafServerForIntermediateStage()) {
       Map<Integer, QueryServerInstance> workerIdToServerInstanceMap = metadata.getWorkerIdToServerInstanceMap();
       assert workerIdToServerInstanceMap != null;
       context.getLeafServerInstances().addAll(workerIdToServerInstanceMap.values());
+    }
+    // Track empty leaf stage for short-circuit detection.
+    // The replicated path returns early above and is excluded: replicated leaves
+    // broadcast segments to all servers rather than populating workerIdToServerInstanceMap.
+    context.recordLeafStageAssigned();
+    if (metadata.getWorkerIdToServerInstanceMap().isEmpty()) {
+      context.recordLeafStageEmpty();
     }
   }
 
   // --------------------------------------------------------------------------
   // Non-partitioned leaf stage assignment
   // --------------------------------------------------------------------------
-  private void assignWorkersToNonPartitionedLeafFragment(DispatchablePlanMetadata metadata,
+  private void assignWorkersToNonPartitionedLeafFragment(PlanFragment fragment, DispatchablePlanMetadata metadata,
       DispatchablePlanContext context) {
     String tableName = metadata.getScannedTables().get(0);
-    Map<String, RoutingTable> routingTableMap =
-        getRoutingTable(tableName, context.getRequestId(), context.getPlannerContext().getOptions());
+    PinotQuery routingPinotQuery = extractRoutingQuery(fragment.getFragmentRoot(), tableName, context);
+    // When broker pruning is enabled, routingPinotQuery carries the leaf stage filter so that segment pruners can
+    // eliminate segments. When disabled (null), fall back to an unfiltered SELECT * routing request.
+    Map<String, RoutingTable> routingTableMap = null;
+    if (routingPinotQuery != null) {
+      try {
+        routingTableMap = getRoutingTable(routingPinotQuery, context.getRequestId());
+      } catch (RuntimeException e) {
+        // Pruning is best-effort: never fail a query that would otherwise route successfully unpruned.
+        LOGGER.warn("Broker pruning skipped for table {} due to routing failure", tableName, e);
+        routingPinotQuery = null;
+      }
+    }
+    if (routingTableMap == null) {
+      routingTableMap = getRoutingTable(tableName, context.getRequestId(), context.getPlannerContext().getOptions());
+    }
     Preconditions.checkState(!routingTableMap.isEmpty(), "Unable to find routing entries for table: %s", tableName);
 
     // acquire time boundary info if it is a hybrid table.
@@ -536,6 +584,9 @@ public class WorkerManager {
       if (!routingTable.getUnavailableSegments().isEmpty()) {
         metadata.addUnavailableSegments(tableName, routingTable.getUnavailableSegments());
       }
+      if (routingPinotQuery != null) {
+        context.addNumSegmentsPrunedByBroker(routingTable.getNumPrunedSegments());
+      }
     }
     // Sort server instances to ensure deterministic worker ID assignment.
     // This is critical for pre-partitioned exchanges where worker ID N on one stage
@@ -564,7 +615,8 @@ public class WorkerManager {
   }
 
   /**
-   * Acquire routing table for items listed in {@link TableScanNode}.
+   * Acquire routing table for items listed in {@link TableScanNode}. Creates a bare {@code SELECT *} broker request
+   * with no filter, so no broker-side segment pruning occurs.
    *
    * @param tableName table name with or without type suffix.
    * @return keyed-map from table type(s) to routing table(s).
@@ -597,6 +649,61 @@ public class WorkerManager {
     }
   }
 
+  /**
+   * Acquire routing table using a pre-built {@link PinotQuery} that carries filter expressions for segment pruning.
+   * Unlike {@link #getRoutingTable(String, long)} which creates a bare {@code SELECT *} broker request,
+   * this overload forwards the filter to the routing manager so broker-side segment pruners can eliminate
+   * segments before dispatching to servers.
+   *
+   * @param pinotQuery the routing query with filter expressions for pruning. Table name may be raw or typed.
+   * @return keyed-map from table type(s) to routing table(s).
+   */
+  private Map<String, RoutingTable> getRoutingTable(PinotQuery pinotQuery, long requestId) {
+    TableType tableType = TableNameBuilder.getTableTypeFromTableName(pinotQuery.getDataSource().getTableName());
+    if (tableType == null) {
+      Map<String, RoutingTable> routingTableMap = new HashMap<>(4);
+      RoutingTable offlineRoutingTable = getRoutingTableHelper(pinotQuery, requestId, TableType.OFFLINE);
+      if (offlineRoutingTable != null) {
+        routingTableMap.put(TableType.OFFLINE.name(), offlineRoutingTable);
+      }
+      RoutingTable realtimeRoutingTable = getRoutingTableHelper(pinotQuery, requestId, TableType.REALTIME);
+      if (realtimeRoutingTable != null) {
+        routingTableMap.put(TableType.REALTIME.name(), realtimeRoutingTable);
+      }
+      return routingTableMap;
+    } else {
+      RoutingTable routingTable = getRoutingTableHelper(pinotQuery, requestId);
+      return routingTable != null ? Map.of(tableType.name(), routingTable) : Map.of();
+    }
+  }
+
+  /**
+   * Builds a {@link PinotQuery} from the leaf stage tree for broker-side segment pruning on the logical planner path.
+   * Returns {@code null} if broker pruning is disabled or the leaf stage shape is unsupported.
+   */
+  @Nullable
+  private PinotQuery extractRoutingQuery(PlanNode leafStageRoot, String tableName, DispatchablePlanContext context) {
+    boolean defaultLogicalPlannerUseBrokerPruning =
+        context.getPlannerContext().getEnvConfig().defaultLogicalPlannerUseBrokerPruning();
+    boolean useBrokerPruning = QueryOptionsUtils.isUseBrokerPruning(
+        context.getPlannerContext().getOptions(), defaultLogicalPlannerUseBrokerPruning);
+    if (!useBrokerPruning) {
+      return null;
+    }
+    try {
+      PinotQuery pinotQuery = PlanNodeRoutingQueryBuilder.createPinotQueryForRouting(tableName, leafStageRoot, false);
+      Map<String, String> queryOptions = context.getPlannerContext().getOptions();
+      if (MapUtils.isNotEmpty(queryOptions)) {
+        pinotQuery.setQueryOptions(new HashMap<>(queryOptions));
+      }
+      return pinotQuery;
+    } catch (RuntimeException e) {
+      LOGGER.warn("Broker pruning skipped for table {} due to unsupported leaf stage shape: {}",
+          tableName, e.getMessage());
+      return null;
+    }
+  }
+
   @Nullable
   private RoutingTable getRoutingTableHelper(String tableNameWithType, long requestId,
       Map<String, String> queryOptions) {
@@ -607,6 +714,19 @@ public class WorkerManager {
       brokerRequest.getPinotQuery().setQueryOptions(new HashMap<>(queryOptions));
     }
     return _routingManager.getRoutingTable(brokerRequest, requestId);
+  }
+
+  @Nullable
+  private RoutingTable getRoutingTableHelper(PinotQuery pinotQuery, long requestId) {
+    return _routingManager.getRoutingTable(CalciteSqlCompiler.convertToBrokerRequest(pinotQuery), requestId);
+  }
+
+  @Nullable
+  private RoutingTable getRoutingTableHelper(PinotQuery pinotQuery, long requestId, TableType tableType) {
+    PinotQuery copy = pinotQuery.deepCopy();
+    copy.getDataSource().setTableName(TableNameBuilder.forType(tableType).tableNameWithType(
+        TableNameBuilder.extractRawTableName(pinotQuery.getDataSource().getTableName())));
+    return getRoutingTableHelper(copy, requestId);
   }
 
   // --------------------------------------------------------------------------
@@ -632,6 +752,15 @@ public class WorkerManager {
 
     // TODO: Support unavailable segments and optional segments for replicated leaf stage
     metadata.setReplicatedSegments(segmentsMap);
+    filterReplicatedLeafStageSegments(context, metadata);
+  }
+
+  /** Extension point to filter the non-replicated leaf-stage per-worker segment assignment; no-op by default. */
+  protected void filterLeafStageSegments(DispatchablePlanContext context, DispatchablePlanMetadata metadata) {
+  }
+
+  /** Extension point to filter the replicated leaf-stage segments; no-op by default. */
+  protected void filterReplicatedLeafStageSegments(DispatchablePlanContext context, DispatchablePlanMetadata metadata) {
   }
 
   /**
@@ -668,8 +797,8 @@ public class WorkerManager {
         CalciteSqlCompiler.compileToBrokerRequest("SELECT * FROM \"" + tableNameWithType + "\""), samplerName);
   }
 
-  private void assignWorkersToNonPartitionedLeafFragmentForLogicalTable(DispatchablePlanMetadata metadata,
-      DispatchablePlanContext context) {
+  private void assignWorkersToNonPartitionedLeafFragmentForLogicalTable(PlanFragment fragment,
+      DispatchablePlanMetadata metadata, DispatchablePlanContext context) {
     LogicalTableRouteInfo logicalTableRouteInfo = metadata.getLogicalTableRouteInfo();
     Preconditions.checkNotNull(logicalTableRouteInfo);
     LogicalTableRouteProvider tableRouteProvider = new LogicalTableRouteProvider();
@@ -677,30 +806,77 @@ public class WorkerManager {
     if (logicalTableRouteInfo.getTimeBoundaryInfo() != null) {
       metadata.setTimeBoundaryInfo(logicalTableRouteInfo.getTimeBoundaryInfo());
     }
-    BrokerRequest offlineBrokerRequest = null;
-    BrokerRequest realtimeBrokerRequest = null;
     Map<String, String> queryOptions = context.getPlannerContext().getOptions();
 
-    if (logicalTableRouteInfo.hasOffline()) {
-      offlineBrokerRequest = CalciteSqlCompiler.compileToBrokerRequest(
-          "SELECT * FROM \"" + logicalTableRouteInfo.getOfflineTableName() + "\"");
-      if (MapUtils.isNotEmpty(queryOptions) && offlineBrokerRequest.isSetPinotQuery()) {
-        offlineBrokerRequest.getPinotQuery().setQueryOptions(new HashMap<>(queryOptions));
+    // Broker pruning: build a filter-bearing routing query (null when disabled/unsupported). When non-null, each
+    // physical table's route below carries the filter so segment pruners can eliminate segments; when null, fall back
+    // to an unfiltered SELECT * per table type. The physical route resolution ignores the data source table name (it
+    // uses the physical table names), so we set the typed logical name here purely to build a valid broker request.
+    String rawTableName = TableNameBuilder.extractRawTableName(
+        logicalTableRouteInfo.hasOffline() ? logicalTableRouteInfo.getOfflineTableName()
+            : logicalTableRouteInfo.getRealtimeTableName());
+    PinotQuery routingPinotQuery = extractRoutingQuery(fragment.getFragmentRoot(), rawTableName, context);
+
+    boolean routed = false;
+    if (routingPinotQuery != null) {
+      try {
+        calculateLogicalTableRoutes(tableRouteProvider, logicalTableRouteInfo, routingPinotQuery, queryOptions,
+            context);
+        context.addNumSegmentsPrunedByBroker(logicalTableRouteInfo.getNumPrunedSegmentsTotal());
+        routed = true;
+      } catch (RuntimeException e) {
+        // Pruning is best-effort: never fail a query that would otherwise route successfully unpruned. Re-running
+        // unfiltered below is safe because calculateRoutes assigns (rather than accumulates) the per-table routing
+        // state, fully overwriting anything the failed attempt wrote.
+        LOGGER.warn("Broker pruning skipped for logical table {} due to routing failure", rawTableName, e);
       }
     }
-
-    if (logicalTableRouteInfo.hasRealtime()) {
-      realtimeBrokerRequest = CalciteSqlCompiler.compileToBrokerRequest(
-          "SELECT * FROM \"" + logicalTableRouteInfo.getRealtimeTableName() + "\"");
-      if (MapUtils.isNotEmpty(queryOptions) && realtimeBrokerRequest.isSetPinotQuery()) {
-        realtimeBrokerRequest.getPinotQuery().setQueryOptions(new HashMap<>(queryOptions));
-      }
+    if (!routed) {
+      calculateLogicalTableRoutes(tableRouteProvider, logicalTableRouteInfo, null, queryOptions, context);
     }
-
-    tableRouteProvider.calculateRoutes(logicalTableRouteInfo, _routingManager, offlineBrokerRequest,
-        realtimeBrokerRequest, context.getRequestId());
 
     assignTableSegmentsToWorkers(logicalTableRouteInfo, metadata);
+  }
+
+  /**
+   * Builds the per-table-type routing {@link BrokerRequest}s for a logical table (filter-bearing when
+   * {@code routingPinotQuery} is non-null, bare {@code SELECT *} otherwise) and calculates the routes.
+   */
+  private void calculateLogicalTableRoutes(LogicalTableRouteProvider tableRouteProvider,
+      LogicalTableRouteInfo logicalTableRouteInfo, @Nullable PinotQuery routingPinotQuery,
+      Map<String, String> queryOptions, DispatchablePlanContext context) {
+    BrokerRequest offlineBrokerRequest = logicalTableRouteInfo.hasOffline() ? buildLogicalTableRoutingBrokerRequest(
+        logicalTableRouteInfo.getOfflineTableName(), routingPinotQuery, queryOptions) : null;
+    BrokerRequest realtimeBrokerRequest = logicalTableRouteInfo.hasRealtime() ? buildLogicalTableRoutingBrokerRequest(
+        logicalTableRouteInfo.getRealtimeTableName(), routingPinotQuery, queryOptions) : null;
+    tableRouteProvider.calculateRoutes(logicalTableRouteInfo, _routingManager, offlineBrokerRequest,
+        realtimeBrokerRequest, context.getRequestId());
+  }
+
+  /**
+   * Builds the routing {@link BrokerRequest} for one physical table type of a logical table. When {@code
+   * routingPinotQuery} is non-null it carries the leaf-stage filter so segment pruners can eliminate segments;
+   * otherwise a bare {@code SELECT *} is used (no pruning). The data source is set to {@code logicalTableNameWithType}
+   * (the typed logical table name; physical table names are resolved later by the route provider).
+   *
+   * <p>The given {@code routingPinotQuery} is not modified: it is deep-copied before the table name is rewritten, so
+   * the same instance can be reused to build both the offline and realtime requests.
+   */
+  @VisibleForTesting
+  static BrokerRequest buildLogicalTableRoutingBrokerRequest(String logicalTableNameWithType,
+      @Nullable PinotQuery routingPinotQuery, Map<String, String> queryOptions) {
+    BrokerRequest brokerRequest;
+    if (routingPinotQuery != null) {
+      PinotQuery pinotQuery = routingPinotQuery.deepCopy();
+      pinotQuery.getDataSource().setTableName(logicalTableNameWithType);
+      brokerRequest = CalciteSqlCompiler.convertToBrokerRequest(pinotQuery);
+    } else {
+      brokerRequest = CalciteSqlCompiler.compileToBrokerRequest("SELECT * FROM \"" + logicalTableNameWithType + "\"");
+    }
+    if (MapUtils.isNotEmpty(queryOptions) && brokerRequest.isSetPinotQuery()) {
+      brokerRequest.getPinotQuery().setQueryOptions(new HashMap<>(queryOptions));
+    }
+    return brokerRequest;
   }
 
   private static void assignTableSegmentsToWorkers(LogicalTableRouteInfo logicalTableRouteInfo,
@@ -772,7 +948,8 @@ public class WorkerManager {
   // Partitioned leaf stage assignment
   // --------------------------------------------------------------------------
   private void assignWorkersToPartitionedLeafFragment(DispatchablePlanMetadata metadata,
-      DispatchablePlanContext context, String partitionKey, Map<String, String> tableOptions) {
+      DispatchablePlanContext context, String partitionKey, Map<String, String> tableOptions,
+      @Nullable PinotQuery routingPinotQuery) {
     // when partition key exist, we assign workers for leaf-stage in partitioned fashion.
 
     String numPartitionsStr = tableOptions.get(PinotHintOptions.TableHintOptions.PARTITION_SIZE);
@@ -795,41 +972,152 @@ public class WorkerManager {
     int numPartitions = partitionInfoMap.length;
     assert numPartitions % numWorkers == 0;
     int numPartitionsPerWorker = numPartitions / numWorkers;
-    Map<Integer, QueryServerInstance> workedIdToServerInstanceMap = new HashMap<>();
+
+    // Broker pruning: the partitions to keep (null means keep all). Partitions absent from the set are skipped below.
+    Set<Integer> partitionsToKeep =
+        computePartitionsToKeep(routingPinotQuery, metadata, context.getRequestId(), partitionInfoMap);
+    if (partitionsToKeep != null) {
+      long numSegmentsPrunedByBroker = countPrunedSegments(partitionInfoMap, partitionsToKeep);
+      if (numSegmentsPrunedByBroker > 0) {
+        context.addNumSegmentsPrunedByBroker(numSegmentsPrunedByBroker);
+      }
+    }
+
+    Map<Integer, QueryServerInstance> workerIdToServerInstanceMap = new HashMap<>();
     Map<Integer, Map<String, List<String>>> workerIdToSegmentsMap = new HashMap<>();
     if (numPartitionsPerWorker == 1) {
-      assignOnePartitionPerWorker(tableName, context.getRequestId(), partitionInfoMap,
-          _routingManager.getEnabledServerInstanceMap(), workedIdToServerInstanceMap, workerIdToSegmentsMap);
+      assignOnePartitionPerWorker(tableName, context.getRequestId(), partitionInfoMap, partitionsToKeep,
+          _routingManager.getEnabledServerInstanceMap(), workerIdToServerInstanceMap, workerIdToSegmentsMap);
     } else {
       assignMultiplePartitionsPerWorker(tableName, context.getRequestId(), numPartitionsPerWorker, partitionInfoMap,
-          _routingManager.getEnabledServerInstanceMap(), workedIdToServerInstanceMap, workerIdToSegmentsMap);
+          partitionsToKeep, _routingManager.getEnabledServerInstanceMap(), workerIdToServerInstanceMap,
+          workerIdToSegmentsMap);
     }
-    metadata.setWorkerIdToServerInstanceMap(workedIdToServerInstanceMap);
+    metadata.setWorkerIdToServerInstanceMap(workerIdToServerInstanceMap);
     metadata.setWorkerIdToSegmentsMap(workerIdToSegmentsMap);
     metadata.setTimeBoundaryInfo(partitionTableInfo._timeBoundaryInfo);
     metadata.setPartitionFunction(partitionFunction);
   }
 
-  /// Pick one worker per partition for partitioned leaf stage.
+  /**
+   * Broker pruning for the partitioned leaf path. Returns the set of partition ids that still have at least one segment
+   * matching the query filter, or {@code null} to keep all partitions.
+   *
+   * <p>Returns {@code null} (no pruning) when any of the following hold:
+   * <ul>
+   *   <li>broker pruning is disabled or the leaf shape is unsupported (the routing query is {@code null}), or there is
+   *   no filter to prune with;</li>
+   *   <li>the leaf feeds a pre-partitioned (1-to-1 direct) exchange -- dropping/compacting workers would misalign
+   *   sender/receiver worker ids in {@code MailboxAssignmentVisitor}. A non-pre-partitioned leaf is shuffled via
+   *   {@code connectWorkers}, which re-hashes across any worker count, so pruning is safe there;</li>
+   *   <li>routing fails (pruning is best-effort);</li>
+   *   <li>every partition would be pruned -- an empty worker map would break exchanges in a multi-leaf plan (the
+   *   all-leaves-empty short-circuit does not fire for a partially-empty plan), and the server-side filter still
+   *   yields the correct empty result unpruned.</li>
+   * </ul>
+   *
+   * <p>Partition survival is decided by routing the filter-bearing query through the {@link RoutingManager} (the same
+   * mechanism the non-partitioned path uses), so the segment-level pruners judge survival using each segment's own
+   * partition metadata. This is correct for every partition function and configuration, unlike recomputing the
+   * partition id from the table-level function name (which lacks the per-segment function config). A partition is
+   * dropped only when every one of its segments was pruned; a segment that merely became unavailable keeps its
+   * partition alive so matching data is never silently dropped.
+   *
+   * <p>Note that pruning here is partition-level, not segment-level: a surviving partition dispatches all of its
+   * segments, including ones the pruners eliminated (the server-side pruners drop those again cheaply). This keeps
+   * surviving partitions' assignments identical to the unpruned path -- the only behavioral delta is dropped
+   * workers -- at the cost of a lower pruning ceiling than the non-partitioned path for partitions with mixed-match
+   * segments. Segment-level pruning within surviving partitions is a possible follow-up.
+   */
+  @Nullable
+  private Set<Integer> computePartitionsToKeep(@Nullable PinotQuery routingPinotQuery,
+      DispatchablePlanMetadata metadata, long requestId, PartitionInfo[] partitionInfoMap) {
+    if (routingPinotQuery == null || routingPinotQuery.getFilterExpression() == null || metadata.isPrePartitioned()) {
+      return null;
+    }
+    Map<String, RoutingTable> routingTableMap;
+    try {
+      routingTableMap = getRoutingTable(routingPinotQuery, requestId);
+    } catch (RuntimeException e) {
+      // Pruning is best-effort: never fail a query that would otherwise route successfully unpruned.
+      LOGGER.warn("Broker pruning skipped for partitioned table {} due to routing failure",
+          routingPinotQuery.getDataSource().getTableName(), e);
+      return null;
+    }
+    if (routingTableMap.isEmpty()) {
+      return null;
+    }
+    Set<String> matchedSegments = new HashSet<>();
+    for (RoutingTable routingTable : routingTableMap.values()) {
+      for (SegmentsToQuery segmentsToQuery : routingTable.getServerInstanceToSegmentsMap().values()) {
+        matchedSegments.addAll(segmentsToQuery.getSegments());
+      }
+      // Keep a partition alive if any of its segments is merely unavailable (rather than pruned) so we never drop data.
+      matchedSegments.addAll(routingTable.getUnavailableSegments());
+    }
+    Set<Integer> partitionsToKeep = new HashSet<>();
+    for (int i = 0; i < partitionInfoMap.length; i++) {
+      PartitionInfo partitionInfo = partitionInfoMap[i];
+      if (partitionInfo != null && (containsAny(partitionInfo._offlineSegments, matchedSegments) || containsAny(
+          partitionInfo._realtimeSegments, matchedSegments))) {
+        partitionsToKeep.add(i);
+      }
+    }
+    // If everything would be pruned, keep all partitions to avoid an empty worker map (see the javadoc above).
+    return partitionsToKeep.isEmpty() ? null : partitionsToKeep;
+  }
+
+  private static boolean containsAny(@Nullable List<String> segments, Set<String> matchedSegments) {
+    if (segments != null) {
+      for (String segment : segments) {
+        if (matchedSegments.contains(segment)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// Counts the segments in partitions dropped by broker pruning (those absent from {@code partitionsToKeep}).
+  private static long countPrunedSegments(PartitionInfo[] partitionInfoMap, Set<Integer> partitionsToKeep) {
+    long numPrunedSegments = 0;
+    for (int i = 0; i < partitionInfoMap.length; i++) {
+      PartitionInfo partitionInfo = partitionInfoMap[i];
+      if (partitionInfo != null && !partitionsToKeep.contains(i)) {
+        numPrunedSegments += CollectionUtils.size(partitionInfo._offlineSegments)
+            + CollectionUtils.size(partitionInfo._realtimeSegments);
+      }
+    }
+    return numPrunedSegments;
+  }
+
+  /// Pick one worker per partition for partitioned leaf stage. When {@code partitionsToKeep} is non-null (broker
+  /// pruning is active), partitions absent from the set are pruned by the query filter and skipped.
   private void assignOnePartitionPerWorker(String tableName, long requestId, PartitionInfo[] partitionInfoMap,
-      Map<String, ServerInstance> enabledServerInstanceMap,
-      Map<Integer, QueryServerInstance> workedIdToServerInstanceMap,
+      @Nullable Set<Integer> partitionsToKeep, Map<String, ServerInstance> enabledServerInstanceMap,
+      Map<Integer, QueryServerInstance> workerIdToServerInstanceMap,
       Map<Integer, Map<String, List<String>>> workerIdToSegmentsMap) {
     int numPartitions = partitionInfoMap.length;
     int workerId = 0;
     for (int i = 0; i < numPartitions; i++) {
+      // Skip partitions pruned by the broker filter. Empty partitions are never in partitionsToKeep, so under pruning
+      // they are skipped here too; the precondition below only fires when pruning is inactive (partitionsToKeep null).
+      if (partitionsToKeep != null && !partitionsToKeep.contains(i)) {
+        continue;
+      }
       PartitionInfo partitionInfo = partitionInfoMap[i];
       // TODO: Currently we don't support the case when a partition doesn't contain any segment. The reason is that
       //       the leaf stage won't be able to directly return empty response.
       Preconditions.checkState(partitionInfo != null, "Failed to find any segment for table: %s, partition: %s",
           tableName, i);
-      // NOTE: Pick worker based on the request id so that the same worker is picked across different table scan when
-      //       the segments for the same partition is colocated
+      // NOTE: Pick worker based on the request id plus the partition id (not a running counter) so that the same worker
+      //       is picked across different table scans when the segments for the same partition are colocated, and so
+      //       that skipping pruned partitions does not shift the server assignment of the surviving ones.
       ServerInstance serverInstance =
-          pickEnabledServer(partitionInfo._fullyReplicatedServers, enabledServerInstanceMap, requestId++);
+          pickEnabledServer(partitionInfo._fullyReplicatedServers, enabledServerInstanceMap, requestId + i);
       Preconditions.checkState(serverInstance != null,
           "Failed to find enabled fully replicated server for table: %s, partition: %s", tableName, i);
-      workedIdToServerInstanceMap.put(workerId, new QueryServerInstance(serverInstance));
+      workerIdToServerInstanceMap.put(workerId, new QueryServerInstance(serverInstance));
       workerIdToSegmentsMap.put(workerId,
           getSegmentsMap(partitionInfo._offlineSegments, partitionInfo._realtimeSegments));
       workerId++;
@@ -842,8 +1130,9 @@ public class WorkerManager {
   /// E.g. when there are 16 partitions for table A and 4 partitions for table B, we may assign 16 partitions for table
   /// A to 4 workers, where partition 0, 4, 8, 12 goes to worker 0, partition 1, 5, 9, 13 goes to worker 1, etc.
   private void assignMultiplePartitionsPerWorker(String tableName, long requestId, int numPartitionsPerWorker,
-      PartitionInfo[] partitionInfoMap, Map<String, ServerInstance> enabledServerInstanceMap,
-      Map<Integer, QueryServerInstance> workedIdToServerInstanceMap,
+      PartitionInfo[] partitionInfoMap, @Nullable Set<Integer> partitionsToKeep,
+      Map<String, ServerInstance> enabledServerInstanceMap,
+      Map<Integer, QueryServerInstance> workerIdToServerInstanceMap,
       Map<Integer, Map<String, List<String>>> workerIdToSegmentsMap) {
     int numPartitions = partitionInfoMap.length;
     assert numPartitions % numPartitionsPerWorker == 0;
@@ -854,6 +1143,10 @@ public class WorkerManager {
       List<String> offlineSegments = null;
       List<String> realtimeSegments = null;
       for (int j = i; j < numPartitions; j += numWorkers) {
+        if (partitionsToKeep != null && !partitionsToKeep.contains(j)) {
+          // Partition pruned by the broker filter.
+          continue;
+        }
         PartitionInfo partitionInfo = partitionInfoMap[j];
         if (partitionInfo == null) {
           continue;
@@ -878,18 +1171,23 @@ public class WorkerManager {
           }
         }
       }
-      // TODO: Currently we don't support the case when all partitions for a worker don't contain any segment. The
-      //       reason is that the leaf stage won't be able to directly return empty response.
-      Preconditions.checkState(fullyReplicatedServers != null,
-          "Failed to find any segment for table: %s, worker: %s, partitions per worker: %s", tableName, i,
-          numPartitionsPerWorker);
-      // NOTE: Pick worker based on the request id so that the same worker is picked across different table scan when
-      //       the segments for the same partition is colocated
-      ServerInstance serverInstance = pickEnabledServer(fullyReplicatedServers, enabledServerInstanceMap, requestId++);
+      // Without broker pruning we don't support a worker whose partitions all lack segments, because the leaf stage
+      // can't directly return an empty response. With pruning active a fully-pruned worker is legitimate and skipped.
+      if (fullyReplicatedServers == null) {
+        Preconditions.checkState(partitionsToKeep != null,
+            "Failed to find any segment for table: %s, worker: %s, partitions per worker: %s", tableName, i,
+            numPartitionsPerWorker);
+        continue;
+      }
+      // NOTE: Pick worker based on the request id plus the worker index (not a running counter) so that the same worker
+      //       is picked across different table scans when the segments for the same partition are colocated, and so
+      //       that skipping fully-pruned workers does not shift the server assignment of the surviving ones.
+      ServerInstance serverInstance =
+          pickEnabledServer(fullyReplicatedServers, enabledServerInstanceMap, requestId + i);
       Preconditions.checkState(serverInstance != null,
           "Failed to find enabled fully replicated server for table: %s, worker: %s, partitions per worker: %s",
           tableName, i, numPartitionsPerWorker);
-      workedIdToServerInstanceMap.put(workerId, new QueryServerInstance(serverInstance));
+      workerIdToServerInstanceMap.put(workerId, new QueryServerInstance(serverInstance));
       workerIdToSegmentsMap.put(workerId, getSegmentsMap(offlineSegments, realtimeSegments));
       workerId++;
     }

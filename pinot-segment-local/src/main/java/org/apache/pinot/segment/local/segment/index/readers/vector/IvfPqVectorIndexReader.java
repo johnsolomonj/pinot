@@ -20,20 +20,20 @@ package org.apache.pinot.segment.local.segment.index.readers.vector;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.PriorityQueue;
+import org.apache.pinot.segment.local.segment.index.vector.IvfCombinedBuffers;
 import org.apache.pinot.segment.local.segment.index.vector.IvfPqIndexFormat;
-import org.apache.pinot.segment.local.segment.index.vector.IvfPqVectorIndexCreator;
 import org.apache.pinot.segment.local.segment.index.vector.ProductQuantizer;
 import org.apache.pinot.segment.local.segment.index.vector.VectorQuantizationUtils;
 import org.apache.pinot.segment.spi.index.creator.VectorIndexConfig;
+import org.apache.pinot.segment.spi.index.reader.ApproximateRadiusVectorIndexReader;
 import org.apache.pinot.segment.spi.index.reader.FilterAwareVectorIndexReader;
 import org.apache.pinot.segment.spi.index.reader.NprobeAware;
-import org.apache.pinot.segment.spi.store.SegmentDirectoryPaths;
+import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
 import org.roaringbitmap.buffer.MutableRoaringBitmap;
 import org.slf4j.Logger;
@@ -47,7 +47,8 @@ import org.slf4j.LoggerFactory;
  * nearest coarse centroids, then scoring candidates with either asymmetric L2 lookup tables
  * or full reconstructed-vector distance evaluation for non-L2 metrics.</p>
  */
-public class IvfPqVectorIndexReader implements FilterAwareVectorIndexReader, NprobeAware {
+public class IvfPqVectorIndexReader
+    implements FilterAwareVectorIndexReader, ApproximateRadiusVectorIndexReader, NprobeAware {
   private static final Logger LOGGER = LoggerFactory.getLogger(IvfPqVectorIndexReader.class);
 
   /** Default nprobe value when not explicitly configured. */
@@ -72,26 +73,41 @@ public class IvfPqVectorIndexReader implements FilterAwareVectorIndexReader, Npr
   private final String _column;
   private final int _defaultNprobe;
   private final ThreadLocal<Integer> _nprobeOverride = new ThreadLocal<>();
+  // Backing buffer. Closed by this reader only when {@code _ownsBuffer} is true. Contents are
+  // heap-loaded at construction, so it is safe for the caller to retain ownership.
+  private final PinotDataBuffer _buffer;
+  private final boolean _ownsBuffer;
 
   /**
-   * Opens and loads an IVF_PQ index from disk.
-   *
-   * @param column the column name
-   * @param indexDir the segment index directory
-   * @param config vector index configuration
+   * Opens and loads an IVF_PQ index from the given buffer. The reader takes ownership of the
+   * buffer and closes it in {@link #close()}; use the four-arg overload to pass a borrowed
+   * buffer (e.g. one owned by the segment directory).
    */
-  public IvfPqVectorIndexReader(String column, File indexDir, VectorIndexConfig config) {
+  public IvfPqVectorIndexReader(String column, PinotDataBuffer buffer, VectorIndexConfig config) {
+    this(column, buffer, config, /* ownsBuffer */ true);
+  }
+
+  /**
+   * Opens and loads an IVF_PQ index from the given buffer.
+   *
+   * @param column      the column name
+   * @param buffer      the IVF_PQ index buffer (mapped or in-memory)
+   * @param config      vector index configuration
+   * @param ownsBuffer  when {@code true}, the reader closes the buffer in {@link #close()} (or
+   *                    on constructor failure). Pass {@code false} when the buffer is owned by
+   *                    the segment directory (typed entry inside {@code columns.psf}).
+   */
+  public IvfPqVectorIndexReader(String column, PinotDataBuffer buffer, VectorIndexConfig config,
+      boolean ownsBuffer) {
     _column = column;
+    _buffer = buffer;
+    _ownsBuffer = ownsBuffer;
 
-    File indexFile = SegmentDirectoryPaths.findVectorIndexIndexFile(indexDir, column, config);
-    if (indexFile == null || !indexFile.exists()) {
-      throw new IllegalStateException(
-          "Failed to find IVF_PQ index file for column: " + column + " in dir: " + indexDir
-              + ". Expected file: " + column + IvfPqVectorIndexCreator.INDEX_FILE_EXTENSION);
-    }
-
+    // The reader takes ownership of the buffer. If construction throws (bad magic, EOF,
+    // unsupported format version, etc.), release the buffer here so the mmap doesn't leak —
+    // the caller never sees a reader instance to close.
     try {
-      IvfPqIndexFormat.IndexData indexData = IvfPqIndexFormat.read(indexFile);
+      IvfPqIndexFormat.IndexData indexData = IvfPqIndexFormat.read(buffer);
       _dimension = indexData.getDimension();
       _numVectors = indexData.getNumVectors();
       _nlist = indexData.getNlist();
@@ -133,8 +149,17 @@ public class IvfPqVectorIndexReader implements FilterAwareVectorIndexReader, Npr
       LOGGER.info("Loaded IVF_PQ index for column: {}: {} vectors, {} centroids, dim={}, pqM={}, pqNbits={}, "
               + "nprobe={}, distance={}", column, _numVectors, _nlist, _dimension, _pqM, _pqNbits, _defaultNprobe,
           _distanceFunction);
-    } catch (IOException e) {
-      throw new RuntimeException("Failed to load IVF_PQ index for column: " + column + " from file: " + indexFile, e);
+    } catch (Exception e) {
+      // Close the buffer to avoid leaking the mmap when the caller never receives a reader to
+      // close — but only if we own it. Borrowed buffers (segment-directory owned) are released
+      // by their owner.
+      if (_ownsBuffer) {
+        IvfCombinedBuffers.closeQuietly(_buffer);
+      }
+      if (e instanceof RuntimeException) {
+        throw (RuntimeException) e;
+      }
+      throw new RuntimeException("Failed to load IVF_PQ index for column: " + column, e);
     }
   }
 
@@ -268,6 +293,73 @@ public class IvfPqVectorIndexReader implements FilterAwareVectorIndexReader, Npr
   }
 
   @Override
+  public ImmutableRoaringBitmap getDocIdsWithinApproximateRadius(float[] searchQuery, float threshold,
+      int maxCandidates) {
+    Preconditions.checkArgument(searchQuery.length == _dimension,
+        "Query dimension mismatch: expected %s, got %s", _dimension, searchQuery.length);
+    Preconditions.checkArgument(maxCandidates > 0, "maxCandidates must be positive, got: %s", maxCandidates);
+
+    if (_numVectors == 0 || _nlist == 0) {
+      return new MutableRoaringBitmap();
+    }
+
+    float[] query = VectorQuantizationUtils.transformForDistance(searchQuery, _distanceFunction);
+    int effectiveNprobe = Math.min(getNprobe(), _nlist);
+    int[] probeCentroids = findClosestCentroids(query, effectiveNprobe);
+    int effectiveMaxCandidates = Math.min(maxCandidates, _numVectors);
+    PriorityQueue<ScoredDoc> heap = new PriorityQueue<>(effectiveMaxCandidates,
+        (a, b) -> Float.compare(b._distance, a._distance));
+
+    for (int probe : probeCentroids) {
+      float[] centroid = _centroids[probe];
+      float[] queryResidual = VectorQuantizationUtils.subtractVectors(query, centroid);
+      byte[][] listCodes = _listCodes[probe];
+      int[] listDocIds = _listDocIds[probe];
+
+      if (_distanceFunction == VectorIndexConfig.VectorDistanceFunction.EUCLIDEAN
+          || _distanceFunction == VectorIndexConfig.VectorDistanceFunction.L2) {
+        float[][] tables = ProductQuantizer.buildL2DistanceTables(queryResidual, _codebooks, _subvectorLengths);
+        for (int i = 0; i < listDocIds.length; i++) {
+          float distance = 0.0f;
+          byte[] codes = listCodes[i];
+          for (int m = 0; m < _pqM; m++) {
+            distance += tables[m][codes[m] & 0xFF];
+          }
+          if (distance <= threshold) {
+            offer(heap, listDocIds[i], distance, effectiveMaxCandidates);
+          }
+        }
+      } else if (_distanceFunction == VectorIndexConfig.VectorDistanceFunction.INNER_PRODUCT
+          || _distanceFunction == VectorIndexConfig.VectorDistanceFunction.DOT_PRODUCT) {
+        for (int i = 0; i < listDocIds.length; i++) {
+          byte[] codes = listCodes[i];
+          float distance = -computeApproximateDotProduct(query, centroid, codes);
+          if (distance <= threshold) {
+            offer(heap, listDocIds[i], distance, effectiveMaxCandidates);
+          }
+        }
+      } else {
+        float queryNormSquare = dotProduct(query, query);
+        for (int i = 0; i < listDocIds.length; i++) {
+          byte[] codes = listCodes[i];
+          float dotProduct = computeApproximateDotProduct(query, centroid, codes);
+          float normSquare = computeApproximateNormSquare(probe, centroid, codes);
+          float distance = computeCosineDistanceFromDotProduct(dotProduct, queryNormSquare, normSquare);
+          if (distance <= threshold) {
+            offer(heap, listDocIds[i], distance, effectiveMaxCandidates);
+          }
+        }
+      }
+    }
+
+    MutableRoaringBitmap result = new MutableRoaringBitmap();
+    for (ScoredDoc scoredDoc : heap) {
+      result.add(scoredDoc._docId);
+    }
+    return result;
+  }
+
+  @Override
   public void setNprobe(int nprobe) {
     if (nprobe < 1) {
       throw new IllegalArgumentException("nprobe must be >= 1, got: " + nprobe);
@@ -289,6 +381,9 @@ public class IvfPqVectorIndexReader implements FilterAwareVectorIndexReader, Npr
   public void close()
       throws IOException {
     clearNprobe();
+    if (_ownsBuffer && _buffer != null) {
+      _buffer.close();
+    }
   }
 
   private int[] findClosestCentroids(float[] query, int n) {

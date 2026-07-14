@@ -119,6 +119,11 @@ public class VarByteChunkForwardIndexWriter extends BaseChunkForwardIndexWriter 
   }
 
   @Override
+  public void putBigDecimalMV(BigDecimal[] values) {
+    putBytes(ArraySerDeUtils.serializeBigDecimalArray(values));
+  }
+
+  @Override
   public void putStringMV(String[] values) {
     putBytes(ArraySerDeUtils.serializeStringArray(values));
   }
@@ -145,6 +150,9 @@ public class VarByteChunkForwardIndexWriter extends BaseChunkForwardIndexWriter 
    * </ul>
    */
   protected void writeChunk() {
+    if (_trackUncompressedValueSize) {
+      _uncompressedValueSize += _chunkDataOffSet - _chunkHeaderSize;
+    }
     // For partially filled chunks, we still need to clear the offsets for remaining rows, as we reuse this buffer.
     for (int i = _chunkHeaderOffset; i < _chunkHeaderSize; i += Integer.BYTES) {
       _chunkBuffer.putInt(i, 0);
@@ -155,5 +163,10 @@ public class VarByteChunkForwardIndexWriter extends BaseChunkForwardIndexWriter 
     // Reset the chunk offsets.
     _chunkHeaderOffset = 0;
     _chunkDataOffSet = _chunkHeaderSize;
+  }
+
+  @Override
+  public long getRawForwardIndexUncompressedValueSizeInBytes() {
+    return _trackUncompressedValueSize ? _uncompressedValueSize + _chunkDataOffSet - _chunkHeaderSize : -1;
   }
 }

@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.Map;
 import javax.annotation.Nullable;
+import org.apache.pinot.segment.spi.compression.ChunkCompressionType;
 import org.apache.pinot.segment.spi.index.IndexCreator;
 import org.apache.pinot.spi.data.FieldSpec.DataType;
 import org.apache.pinot.spi.utils.MapUtils;
@@ -39,7 +40,7 @@ public interface ForwardIndexCreator extends IndexCreator {
 
   @Override
   default void add(Object cellValue, int dictId) {
-    if (dictId >= 0) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       switch (getValueType()) {
@@ -84,9 +85,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void add(Object[] cellValues, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void add(Object[] cellValues, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       int length = cellValues.length;
@@ -121,6 +121,17 @@ public interface ForwardIndexCreator extends IndexCreator {
             doubles[i] = (Double) cellValues[i];
           }
           putDoubleMV(doubles);
+          break;
+        case BIG_DECIMAL:
+          if (cellValues instanceof BigDecimal[]) {
+            putBigDecimalMV((BigDecimal[]) cellValues);
+          } else {
+            BigDecimal[] bigDecimals = new BigDecimal[length];
+            for (int i = 0; i < length; i++) {
+              bigDecimals[i] = (BigDecimal) cellValues[i];
+            }
+            putBigDecimalMV(bigDecimals);
+          }
           break;
         case STRING:
           if (cellValues instanceof String[]) {
@@ -157,9 +168,8 @@ public interface ForwardIndexCreator extends IndexCreator {
    */
 
   @Override
-  default void addInt(int value, int dictId)
-      throws IOException {
-    if (dictId >= 0) {
+  default void addInt(int value, int dictId) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       putInt(value);
@@ -167,9 +177,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addLong(long value, int dictId)
-      throws IOException {
-    if (dictId >= 0) {
+  default void addLong(long value, int dictId) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       putLong(value);
@@ -177,9 +186,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addFloat(float value, int dictId)
-      throws IOException {
-    if (dictId >= 0) {
+  default void addFloat(float value, int dictId) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       putFloat(value);
@@ -187,9 +195,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addDouble(double value, int dictId)
-      throws IOException {
-    if (dictId >= 0) {
+  default void addDouble(double value, int dictId) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       putDouble(value);
@@ -197,9 +204,17 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addString(String value, int dictId)
-      throws IOException {
-    if (dictId >= 0) {
+  default void addBigDecimal(BigDecimal value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putBigDecimal(value);
+    }
+  }
+
+  @Override
+  default void addString(String value, int dictId) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       putString(value);
@@ -207,9 +222,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addBytes(byte[] value, int dictId)
-      throws IOException {
-    if (dictId >= 0) {
+  default void addBytes(byte[] value, int dictId) {
+    if (isDictionaryEncoded()) {
       putDictId(dictId);
     } else {
       putBytes(value);
@@ -217,9 +231,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addIntMV(int[] values, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void addIntMV(int[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       putIntMV(values);
@@ -227,9 +240,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addLongMV(long[] values, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void addLongMV(long[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       putLongMV(values);
@@ -237,9 +249,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addFloatMV(float[] values, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void addFloatMV(float[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       putFloatMV(values);
@@ -247,9 +258,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addDoubleMV(double[] values, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void addDoubleMV(double[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       putDoubleMV(values);
@@ -257,9 +267,17 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addStringMV(String[] values, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void addBigDecimalMV(BigDecimal[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putBigDecimalMV(values);
+    }
+  }
+
+  @Override
+  default void addStringMV(String[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       putStringMV(values);
@@ -267,9 +285,8 @@ public interface ForwardIndexCreator extends IndexCreator {
   }
 
   @Override
-  default void addBytesMV(byte[][] values, @Nullable int[] dictIds)
-      throws IOException {
-    if (dictIds != null) {
+  default void addBytesMV(byte[][] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
       putDictIdMV(dictIds);
     } else {
       putBytesMV(values);
@@ -292,6 +309,18 @@ public interface ForwardIndexCreator extends IndexCreator {
    * forward index.
    */
   DataType getValueType();
+
+  /// Returns serialized value bytes presented to the raw forward-index chunk compressor, or `-1` when unavailable.
+  default long getRawForwardIndexUncompressedValueSizeInBytes() {
+    return -1;
+  }
+
+  /// Returns the chunk-compression type actually selected by this raw forward-index creator, or `null` when this
+  /// creator is dictionary encoded or does not expose compression statistics.
+  @Nullable
+  default ChunkCompressionType getRawForwardIndexChunkCompressionType() {
+    return null;
+  }
 
   /**
    * DICTIONARY-ENCODED INDEX APIs
@@ -420,6 +449,15 @@ public interface ForwardIndexCreator extends IndexCreator {
    * @param values Values to write
    */
   default void putDoubleMV(double[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Writes the next BIG_DECIMAL type multi-value into the forward index.
+   *
+   * @param values Values to write
+   */
+  default void putBigDecimalMV(BigDecimal[] values) {
     throw new UnsupportedOperationException();
   }
 

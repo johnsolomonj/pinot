@@ -20,7 +20,6 @@ package org.apache.pinot.perf.aggregation;
 
 import it.unimi.dsi.fastutil.ints.IntSet;
 import java.math.BigDecimal;
-import java.util.Collections;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
@@ -107,7 +106,7 @@ public class BenchmarkDistinctCountHLLThreshold {
     for (int i = 0; i < _numBatches; i++) {
       int[] dictIds = _batchedDictIds[i];
       Map<ExpressionContext, BlockValSet> blockValSetMap =
-          Collections.singletonMap(EXPR, new TestBlockValSet(_dictionary, dictIds));
+          Map.of(EXPR, new TestBlockValSet(_dictionary, dictIds));
       _aggregationFunction.aggregate(dictIds.length, resultHolder, blockValSetMap);
     }
 
@@ -198,15 +197,6 @@ public class BenchmarkDistinctCountHLLThreshold {
     @Override
     public Comparable getMaxVal() {
       return "value_" + (_length - 1);
-    }
-
-    @Override
-    public Object getSortedValues() {
-      String[] values = new String[_length];
-      for (int i = 0; i < _length; i++) {
-        values[i] = "value_" + i;
-      }
-      return values;
     }
 
     @Override
@@ -340,6 +330,11 @@ public class BenchmarkDistinctCountHLLThreshold {
 
     @Override
     public double[][] getDoubleValuesMV() {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public BigDecimal[][] getBigDecimalValuesMV() {
       throw new UnsupportedOperationException();
     }
 

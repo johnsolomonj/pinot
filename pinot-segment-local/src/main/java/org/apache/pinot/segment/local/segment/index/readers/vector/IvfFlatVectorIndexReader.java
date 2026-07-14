@@ -20,21 +20,22 @@ package org.apache.pinot.segment.local.segment.index.readers.vector;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import java.io.DataInputStream;
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.PriorityQueue;
-import org.apache.pinot.common.function.scalar.VectorFunctions;
+import org.apache.pinot.segment.local.segment.index.vector.IvfCombinedBuffers;
 import org.apache.pinot.segment.local.segment.index.vector.IvfFlatVectorIndexCreator;
-import org.apache.pinot.segment.spi.V1Constants;
+import org.apache.pinot.segment.local.segment.index.vector.VectorQuantizationUtils;
 import org.apache.pinot.segment.spi.index.creator.VectorIndexConfig;
+import org.apache.pinot.segment.spi.index.creator.VectorQuantizerType;
+import org.apache.pinot.segment.spi.index.reader.ApproximateRadiusVectorIndexReader;
 import org.apache.pinot.segment.spi.index.reader.FilterAwareVectorIndexReader;
 import org.apache.pinot.segment.spi.index.reader.NprobeAware;
-import org.apache.pinot.segment.spi.store.SegmentDirectoryPaths;
+import org.apache.pinot.segment.spi.index.reader.VectorQuantizer;
+import org.apache.pinot.segment.spi.memory.DataBufferPinotInputStream;
+import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
 import org.roaringbitmap.buffer.MutableRoaringBitmap;
 import org.slf4j.Logger;
@@ -58,20 +59,28 @@ import org.slf4j.LoggerFactory;
  * after construction. Query-scoped {@code nprobe} overrides are stored in a {@link ThreadLocal}
  * so concurrent queries cannot overwrite each other's search parameters.</p>
  */
-public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, NprobeAware {
+public class IvfFlatVectorIndexReader
+    implements FilterAwareVectorIndexReader, ApproximateRadiusVectorIndexReader, NprobeAware {
   private static final Logger LOGGER = LoggerFactory.getLogger(IvfFlatVectorIndexReader.class);
 
   /** Default nprobe value when not explicitly set. */
   static final int DEFAULT_NPROBE = 4;
 
+  // Backing buffer. Closed by this reader only when {@code _ownsBuffer} is true. Contents are
+  // heap-loaded at construction, so it is safe for the caller to retain ownership of the buffer.
+  private final PinotDataBuffer _buffer;
+  private final boolean _ownsBuffer;
   // Index data loaded from file
   private final int _dimension;
   private final int _numVectors;
   private final int _nlist;
   private final VectorIndexConfig.VectorDistanceFunction _distanceFunction;
+  private final int _indexFormatVersion;
+  private final VectorQuantizerType _quantizerType;
+  private final VectorQuantizer _quantizer;
   private final float[][] _centroids;
   private final int[][] _listDocIds;
-  private final float[][][] _listVectors;
+  private final byte[][][] _listEncodedVectors;
   private final String _column;
   private final int _defaultNprobe;
 
@@ -79,27 +88,42 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
   private final ThreadLocal<Integer> _nprobeOverride = new ThreadLocal<>();
 
   /**
-   * Opens and loads an IVF_FLAT index from disk.
-   *
-   * @param column    the column name
-   * @param indexDir  the segment index directory
-   * @param config    the vector index configuration
-   * @throws RuntimeException if the index file cannot be read or is corrupt
+   * Opens and loads an IVF_FLAT index from the given buffer. The reader takes ownership of the
+   * buffer and closes it in {@link #close()}; use the four-arg overload to pass a borrowed
+   * buffer (e.g. one owned by the segment directory).
    */
-  public IvfFlatVectorIndexReader(String column, File indexDir, VectorIndexConfig config) {
+  public IvfFlatVectorIndexReader(String column, PinotDataBuffer buffer, VectorIndexConfig config) {
+    this(column, buffer, config, /* ownsBuffer */ true);
+  }
+
+  /**
+   * Opens and loads an IVF_FLAT index from the given buffer.
+   *
+   * <p>The buffer holds the full IVF_FLAT file contents. The reader heap-loads centroids and
+   * inverted lists at construction time, so the buffer can be released once the constructor
+   * returns.</p>
+   *
+   * @param column      the column name
+   * @param buffer      the IVF_FLAT index buffer (mapped or in-memory)
+   * @param config      the vector index configuration
+   * @param ownsBuffer  when {@code true}, the reader closes the buffer in {@link #close()} (or
+   *                    on constructor failure). Pass {@code false} when the buffer is owned by
+   *                    the segment directory (typed entry inside {@code columns.psf}).
+   * @throws RuntimeException if the index buffer cannot be read or is corrupt
+   */
+  public IvfFlatVectorIndexReader(String column, PinotDataBuffer buffer, VectorIndexConfig config,
+      boolean ownsBuffer) {
     _column = column;
+    _buffer = buffer;
+    _ownsBuffer = ownsBuffer;
 
     // Initialize nprobe to the default; query-time tuning should use NprobeAware#setNprobe.
     int configuredNprobe = DEFAULT_NPROBE;
 
-    File indexFile = SegmentDirectoryPaths.findVectorIndexIndexFile(indexDir, column, config);
-    if (indexFile == null || !indexFile.exists()) {
-      throw new IllegalStateException(
-          "Failed to find IVF_FLAT index file for column: " + column + " in dir: " + indexDir
-              + ". Expected file: " + column + V1Constants.Indexes.VECTOR_IVF_FLAT_INDEX_FILE_EXTENSION);
-    }
-
-    try (DataInputStream in = new DataInputStream(new FileInputStream(indexFile))) {
+    // The reader takes ownership of the buffer. If construction throws (header decode failure,
+    // bad magic, EOF, etc.), release the buffer here so the mmap doesn't leak — the caller never
+    // sees a reader instance to close.
+    try (DataBufferPinotInputStream in = new DataBufferPinotInputStream(buffer)) {
       // --- Header ---
       int magic = in.readInt();
       Preconditions.checkState(magic == IvfFlatVectorIndexCreator.MAGIC,
@@ -110,6 +134,7 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
       Preconditions.checkState(version == IvfFlatVectorIndexCreator.FORMAT_VERSION,
           "Unsupported IVF_FLAT format version: %s, expected: %s",
           version, IvfFlatVectorIndexCreator.FORMAT_VERSION);
+      _indexFormatVersion = version;
 
       _dimension = in.readInt();
       _numVectors = in.readInt();
@@ -120,6 +145,23 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
           "Invalid distance function ordinal %s in IVF_FLAT index for column: %s (valid range: 0-%s)",
           distanceFunctionOrdinal, column, allFunctions.length - 1);
       _distanceFunction = allFunctions[distanceFunctionOrdinal];
+
+      int quantizerTypeOrdinal = in.readInt();
+      VectorQuantizerType[] allQuantizerTypes = VectorQuantizerType.values();
+      Preconditions.checkState(quantizerTypeOrdinal >= 0 && quantizerTypeOrdinal < allQuantizerTypes.length,
+          "Invalid quantizer type ordinal %s in IVF_FLAT index for column: %s (valid range: 0-%s)",
+          quantizerTypeOrdinal, column, allQuantizerTypes.length - 1);
+      _quantizerType = allQuantizerTypes[quantizerTypeOrdinal];
+
+      int quantizerParamsLength = in.readInt();
+      Preconditions.checkState(quantizerParamsLength >= 0,
+          "Invalid quantizer params length %s in IVF_FLAT index for column: %s",
+          quantizerParamsLength, column);
+      byte[] quantizerParams = new byte[quantizerParamsLength];
+      if (quantizerParamsLength > 0) {
+        in.readFully(quantizerParams);
+      }
+      _quantizer = VectorQuantizationUtils.createReadQuantizer(_quantizerType, _dimension, quantizerParams);
 
       // Clamp nprobe to valid range
       _defaultNprobe = Math.min(configuredNprobe, _nlist);
@@ -134,7 +176,7 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
 
       // --- Inverted Lists ---
       _listDocIds = new int[_nlist][];
-      _listVectors = new float[_nlist][][];
+      _listEncodedVectors = new byte[_nlist][][];
 
       for (int c = 0; c < _nlist; c++) {
         int listSize = in.readInt();
@@ -142,21 +184,30 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
         for (int i = 0; i < listSize; i++) {
           _listDocIds[c][i] = in.readInt();
         }
-        _listVectors[c] = new float[listSize][_dimension];
+        int encodedBytesPerVector = _quantizer.getEncodedBytesPerVector();
+        _listEncodedVectors[c] = new byte[listSize][encodedBytesPerVector];
         for (int i = 0; i < listSize; i++) {
-          for (int d = 0; d < _dimension; d++) {
-            _listVectors[c][i][d] = in.readFloat();
-          }
+          in.readFully(_listEncodedVectors[c][i]);
         }
       }
 
       // We skip reading the offset table and footer since we read sequentially
 
-      LOGGER.info("Loaded IVF_FLAT index for column: {}: {} vectors, {} centroids, dim={}, nprobe={}, distance={}",
-          column, _numVectors, _nlist, _dimension, getNprobe(), _distanceFunction);
-    } catch (IOException e) {
-      throw new RuntimeException(
-          "Failed to load IVF_FLAT index for column: " + column + " from file: " + indexFile, e);
+      LOGGER.info("Loaded IVF_FLAT index for column: {}: {} vectors, {} centroids, dim={}, nprobe={}, distance={}, "
+              + "formatVersion={}, quantizer={}",
+          column, _numVectors, _nlist, _dimension, getNprobe(), _distanceFunction, _indexFormatVersion,
+          _quantizerType);
+    } catch (Exception e) {
+      // Close the buffer to avoid leaking the mmap when the caller never receives a reader to
+      // close — but only if we own it. Borrowed buffers (segment-directory owned) are released
+      // by their owner.
+      if (_ownsBuffer) {
+        IvfCombinedBuffers.closeQuietly(_buffer);
+      }
+      if (e instanceof RuntimeException) {
+        throw (RuntimeException) e;
+      }
+      throw new RuntimeException("Failed to load IVF_FLAT index for column: " + column, e);
     }
   }
 
@@ -183,10 +234,9 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
 
     for (int probeIdx : probeCentroids) {
       int[] docIds = _listDocIds[probeIdx];
-      float[][] vectors = _listVectors[probeIdx];
 
       for (int i = 0; i < docIds.length; i++) {
-        float dist = computeDistance(searchQuery, vectors[i]);
+        float dist = getDistanceFromList(probeIdx, i, searchQuery);
         if (maxHeap.size() < effectiveTopK) {
           maxHeap.offer(new ScoredDoc(docIds[i], dist));
         } else if (dist < maxHeap.peek()._distance) {
@@ -226,14 +276,13 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
 
     for (int probeIdx : probeCentroids) {
       int[] docIds = _listDocIds[probeIdx];
-      float[][] vectors = _listVectors[probeIdx];
 
       for (int i = 0; i < docIds.length; i++) {
         // Only consider documents that pass the pre-filter
         if (!preFilterBitmap.contains(docIds[i])) {
           continue;
         }
-        float dist = computeDistance(searchQuery, vectors[i]);
+        float dist = getDistanceFromList(probeIdx, i, searchQuery);
         if (maxHeap.size() < effectiveTopK) {
           maxHeap.offer(new ScoredDoc(docIds[i], dist));
         } else if (dist < maxHeap.peek()._distance) {
@@ -244,6 +293,40 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
     }
 
     // Step 3: Collect results into a bitmap
+    MutableRoaringBitmap result = new MutableRoaringBitmap();
+    for (ScoredDoc doc : maxHeap) {
+      result.add(doc._docId);
+    }
+    return result;
+  }
+
+  @Override
+  public ImmutableRoaringBitmap getDocIdsWithinApproximateRadius(float[] searchQuery, float threshold,
+      int maxCandidates) {
+    Preconditions.checkArgument(searchQuery.length == _dimension,
+        "Query dimension mismatch: expected %s, got %s", _dimension, searchQuery.length);
+    Preconditions.checkArgument(maxCandidates > 0, "maxCandidates must be positive, got: %s", maxCandidates);
+
+    if (_numVectors == 0 || _nlist == 0) {
+      return new MutableRoaringBitmap();
+    }
+
+    int effectiveNprobe = Math.min(getNprobe(), _nlist);
+    int[] probeCentroids = findClosestCentroids(searchQuery, effectiveNprobe);
+    int effectiveMaxCandidates = Math.min(maxCandidates, _numVectors);
+    PriorityQueue<ScoredDoc> maxHeap = new PriorityQueue<>(effectiveMaxCandidates,
+        (a, b) -> Float.compare(b._distance, a._distance));
+
+    for (int probeIdx : probeCentroids) {
+      int[] docIds = _listDocIds[probeIdx];
+      for (int i = 0; i < docIds.length; i++) {
+        float distance = getDistanceFromList(probeIdx, i, searchQuery);
+        if (distance <= threshold) {
+          offer(maxHeap, docIds[i], distance, effectiveMaxCandidates);
+        }
+      }
+    }
+
     MutableRoaringBitmap result = new MutableRoaringBitmap();
     for (ScoredDoc doc : maxHeap) {
       result.add(doc._docId);
@@ -286,6 +369,9 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
   public void close()
       throws IOException {
     clearNprobe();
+    if (_ownsBuffer && _buffer != null) {
+      _buffer.close();
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -297,18 +383,11 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
    * Internally uses L2 for EUCLIDEAN/L2, cosine for COSINE, negative dot for INNER_PRODUCT/DOT_PRODUCT.
    */
   private float computeDistance(float[] a, float[] b) {
-    switch (_distanceFunction) {
-      case EUCLIDEAN:
-      case L2:
-        return (float) VectorFunctions.euclideanDistance(a, b);
-      case COSINE:
-        return (float) VectorFunctions.cosineDistance(a, b);
-      case INNER_PRODUCT:
-      case DOT_PRODUCT:
-        return (float) -VectorFunctions.dotProduct(a, b);
-      default:
-        throw new IllegalArgumentException("Unsupported distance function: " + _distanceFunction);
-    }
+    return VectorQuantizationUtils.computeDistance(a, b, _distanceFunction);
+  }
+
+  private float getDistanceFromList(int probeIdx, int listOffset, float[] query) {
+    return _quantizer.computeDistance(query, _listEncodedVectors[probeIdx][listOffset], _distanceFunction);
   }
 
   /**
@@ -348,6 +427,15 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
     return bestIndices;
   }
 
+  private static void offer(PriorityQueue<ScoredDoc> heap, int docId, float distance, int maxCandidates) {
+    if (heap.size() < maxCandidates) {
+      heap.offer(new ScoredDoc(docId, distance));
+    } else if (distance < heap.peek()._distance) {
+      heap.poll();
+      heap.offer(new ScoredDoc(docId, distance));
+    }
+  }
+
   // -----------------------------------------------------------------------
   // Accessors for testing and introspection
   // -----------------------------------------------------------------------
@@ -362,6 +450,9 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
     info.put("nlist", _nlist);
     info.put("distanceFunction", _distanceFunction.name());
     info.put("effectiveNprobe", getNprobe());
+    info.put("indexFormatVersion", _indexFormatVersion);
+    info.put("quantizer", _quantizerType.name());
+    info.put("encodedBytesPerVector", _quantizer.getEncodedBytesPerVector());
 
     int minListSize = Integer.MAX_VALUE;
     int maxListSize = 0;
@@ -411,6 +502,11 @@ public class IvfFlatVectorIndexReader implements FilterAwareVectorIndexReader, N
   @VisibleForTesting
   public int[][] getListDocIds() {
     return _listDocIds;
+  }
+
+  @VisibleForTesting
+  public VectorQuantizerType getQuantizerType() {
+    return _quantizerType;
   }
 
   /**

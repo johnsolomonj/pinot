@@ -21,6 +21,7 @@ package org.apache.pinot.segment.local.segment.creator.impl.fwd;
 import com.google.common.base.Preconditions;
 import java.io.File;
 import java.io.IOException;
+import java.math.BigDecimal;
 import org.apache.pinot.segment.local.io.writer.impl.VarByteChunkForwardIndexWriter;
 import org.apache.pinot.segment.local.io.writer.impl.VarByteChunkForwardIndexWriterV4;
 import org.apache.pinot.segment.local.io.writer.impl.VarByteChunkForwardIndexWriterV6;
@@ -28,7 +29,6 @@ import org.apache.pinot.segment.local.io.writer.impl.VarByteChunkWriter;
 import org.apache.pinot.segment.spi.V1Constants.Indexes;
 import org.apache.pinot.segment.spi.compression.ChunkCompressionType;
 import org.apache.pinot.segment.spi.index.ForwardIndexConfig;
-import org.apache.pinot.segment.spi.index.creator.ForwardIndexCreator;
 import org.apache.pinot.spi.data.FieldSpec.DataType;
 
 
@@ -36,10 +36,11 @@ import org.apache.pinot.spi.data.FieldSpec.DataType;
  * Raw (non-dictionary-encoded) forward index creator for multi-value column of variable length data type (STRING,
  * BYTES).
  */
-public class MultiValueVarByteRawIndexCreator implements ForwardIndexCreator {
+public class MultiValueVarByteRawIndexCreator implements CompressionStatsTrackingForwardIndexCreator {
 
   private final VarByteChunkWriter _indexWriter;
   private final DataType _valueType;
+  private final ChunkCompressionType _chunkCompressionType;
 
   /**
    * Create a var-byte raw index creator for the given column
@@ -95,6 +96,7 @@ public class MultiValueVarByteRawIndexCreator implements ForwardIndexCreator {
       _indexWriter = new VarByteChunkForwardIndexWriterV4(file, compressionType, chunkSize);
     }
     _valueType = valueType;
+    _chunkCompressionType = compressionType;
   }
 
   @Override
@@ -113,6 +115,11 @@ public class MultiValueVarByteRawIndexCreator implements ForwardIndexCreator {
   }
 
   @Override
+  public void putBigDecimalMV(final BigDecimal[] values) {
+    _indexWriter.putBigDecimalMV(values);
+  }
+
+  @Override
   public void putStringMV(final String[] values) {
     _indexWriter.putStringMV(values);
   }
@@ -126,6 +133,21 @@ public class MultiValueVarByteRawIndexCreator implements ForwardIndexCreator {
   public void close()
       throws IOException {
     _indexWriter.close();
+  }
+
+  @Override
+  public long getRawForwardIndexUncompressedValueSizeInBytes() {
+    return _indexWriter.getRawForwardIndexUncompressedValueSizeInBytes();
+  }
+
+  @Override
+  public ChunkCompressionType getRawForwardIndexChunkCompressionType() {
+    return _chunkCompressionType;
+  }
+
+  @Override
+  public void enableRawForwardIndexUncompressedValueSizeTracking() {
+    _indexWriter.enableRawForwardIndexUncompressedValueSizeTracking();
   }
 
   /**

@@ -22,7 +22,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,7 +36,6 @@ import org.apache.helix.store.zk.ZkHelixPropertyStore;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.helix.zookeeper.zkclient.exception.ZkBadVersionException;
 import org.apache.pinot.common.assignment.InstancePartitions;
-import org.apache.pinot.common.metadata.instance.InstanceZKMetadata;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.utils.LLCSegmentName;
 import org.apache.pinot.common.utils.LogicalTableConfigUtils;
@@ -80,10 +78,12 @@ public class ZKMetadataProvider {
   private static final String PROPERTYSTORE_DATABASE_CONFIGS_PREFIX = "/CONFIGS/DATABASE";
   private static final String PROPERTYSTORE_TABLE_CONFIGS_PREFIX = "/CONFIGS/TABLE";
   private static final String PROPERTYSTORE_USER_CONFIGS_PREFIX = "/CONFIGS/USER";
-  private static final String PROPERTYSTORE_INSTANCE_CONFIGS_PREFIX = "/CONFIGS/INSTANCE";
   private static final String PROPERTYSTORE_CLUSTER_CONFIGS_PREFIX = "/CONFIGS/CLUSTER";
   private static final String PROPERTYSTORE_SEGMENT_LINEAGE = "/SEGMENT_LINEAGE";
   private static final String PROPERTYSTORE_MINION_TASK_METADATA_PREFIX = "/MINION_TASK_METADATA";
+  private static final String PROPERTYSTORE_MATERIALIZED_VIEW_DEFINITION_PREFIX =
+      "/CONFIGS/MATERIALIZED_VIEW/DEFINITION";
+  private static final String PROPERTYSTORE_MATERIALIZED_VIEW_RUNTIME_PREFIX = "/CONFIGS/MATERIALIZED_VIEW/RUNTIME";
   private static final String PROPERTYSTORE_QUERY_WORKLOAD_CONFIGS_PREFIX = "/CONFIGS/QUERYWORKLOAD";
   private static final String PROPERTYSTORE_TASK_LOCK_SUFFIX = "-Lock";
 
@@ -236,23 +236,6 @@ public class ZKMetadataProvider {
     setTableConfig(propertyStore, offlineTableName, znRecord);
   }
 
-  public static void setInstanceZKMetadata(ZkHelixPropertyStore<ZNRecord> propertyStore,
-      InstanceZKMetadata instanceZKMetadata) {
-    ZNRecord znRecord = instanceZKMetadata.toZNRecord();
-    propertyStore.set(StringUtil.join("/", PROPERTYSTORE_INSTANCE_CONFIGS_PREFIX, instanceZKMetadata.getId()), znRecord,
-        AccessOption.PERSISTENT);
-  }
-
-  public static InstanceZKMetadata getInstanceZKMetadata(ZkHelixPropertyStore<ZNRecord> propertyStore,
-      String instanceId) {
-    ZNRecord znRecord = propertyStore.get(StringUtil.join("/", PROPERTYSTORE_INSTANCE_CONFIGS_PREFIX, instanceId), null,
-        AccessOption.PERSISTENT);
-    if (znRecord == null) {
-      return null;
-    }
-    return new InstanceZKMetadata(znRecord);
-  }
-
   public static String constructPropertyStorePathForSegment(String resourceName, String segmentName) {
     return StringUtil.join("/", PROPERTYSTORE_SEGMENTS_PREFIX, resourceName, segmentName);
   }
@@ -326,6 +309,23 @@ public class ZKMetadataProvider {
   public static String constructPropertyStorePathForMinionTaskMetadataDeprecated(String taskType,
       String tableNameWithType) {
     return StringUtil.join("/", PROPERTYSTORE_MINION_TASK_METADATA_PREFIX, taskType, tableNameWithType);
+  }
+
+  public static String getPropertyStorePathForMaterializedViewDefinitionPrefix() {
+    return PROPERTYSTORE_MATERIALIZED_VIEW_DEFINITION_PREFIX;
+  }
+
+  public static String constructPropertyStorePathForMaterializedViewDefinition(
+      String materializedViewTableNameWithType) {
+    return StringUtil.join("/", PROPERTYSTORE_MATERIALIZED_VIEW_DEFINITION_PREFIX, materializedViewTableNameWithType);
+  }
+
+  public static String getPropertyStorePathForMaterializedViewRuntimePrefix() {
+    return PROPERTYSTORE_MATERIALIZED_VIEW_RUNTIME_PREFIX;
+  }
+
+  public static String constructPropertyStorePathForMaterializedViewRuntime(String materializedViewTableNameWithType) {
+    return StringUtil.join("/", PROPERTYSTORE_MATERIALIZED_VIEW_RUNTIME_PREFIX, materializedViewTableNameWithType);
   }
 
   public static String constructPropertyStorePathForLogical(String tableName) {
@@ -616,7 +616,7 @@ public class ZKMetadataProvider {
       return tableConfigs;
     } else {
       LOGGER.warn("Path: {} does not exist", PROPERTYSTORE_TABLE_CONFIGS_PREFIX);
-      return Collections.emptyList();
+      return List.of();
     }
   }
 
@@ -721,7 +721,7 @@ public class ZKMetadataProvider {
       return segmentsZKMetadata;
     } else {
       LOGGER.warn("Path: {} does not exist", parentPath);
-      return Collections.emptyList();
+      return List.of();
     }
   }
 
@@ -737,7 +737,7 @@ public class ZKMetadataProvider {
     if (propertyStore.exists(segmentsPath, AccessOption.PERSISTENT)) {
       return propertyStore.getChildNames(segmentsPath, AccessOption.PERSISTENT);
     } else {
-      return Collections.emptyList();
+      return List.of();
     }
   }
 
@@ -859,7 +859,7 @@ public class ZKMetadataProvider {
         propertyStore.getChildren(getPropertyStoreWorkloadConfigsPrefix(), null, AccessOption.PERSISTENT,
             CommonConstants.Helix.ZkClient.RETRY_COUNT, CommonConstants.Helix.ZkClient.RETRY_INTERVAL_MS);
     if (znRecords == null) {
-      return Collections.emptyList();
+      return List.of();
     }
     int numZNRecords = znRecords.size();
     List<QueryWorkloadConfig> queryWorkloadConfigs = new ArrayList<>(numZNRecords);
@@ -924,7 +924,7 @@ public class ZKMetadataProvider {
         }
       }).filter(Objects::nonNull).collect(Collectors.toList());
     } else {
-      return Collections.emptyList();
+      return List.of();
     }
   }
 

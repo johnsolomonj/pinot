@@ -30,7 +30,6 @@ import org.apache.pinot.common.request.context.FilterContext;
 import org.apache.pinot.common.request.context.FunctionContext;
 import org.apache.pinot.common.request.context.predicate.JsonMatchPredicate;
 import org.apache.pinot.common.request.context.predicate.Predicate;
-import org.apache.pinot.common.request.context.predicate.RegexpLikePredicate;
 import org.apache.pinot.common.request.context.predicate.TextMatchPredicate;
 import org.apache.pinot.common.request.context.predicate.VectorSimilarityPredicate;
 import org.apache.pinot.common.request.context.predicate.VectorSimilarityRadiusPredicate;
@@ -54,8 +53,6 @@ import org.apache.pinot.core.operator.filter.VectorSearchMode;
 import org.apache.pinot.core.operator.filter.VectorSearchParams;
 import org.apache.pinot.core.operator.filter.VectorSearchStrategy;
 import org.apache.pinot.core.operator.filter.VectorSimilarityFilterOperator;
-import org.apache.pinot.core.operator.filter.predicate.FSTBasedRegexpPredicateEvaluatorFactory;
-import org.apache.pinot.core.operator.filter.predicate.IFSTBasedRegexpPredicateEvaluatorFactory;
 import org.apache.pinot.core.operator.filter.predicate.PredicateEvaluator;
 import org.apache.pinot.core.operator.filter.predicate.PredicateEvaluatorProvider;
 import org.apache.pinot.core.operator.transform.function.ItemTransformFunction;
@@ -306,29 +303,10 @@ public class FilterPlanNode implements PlanNode {
                 return new TextMatchFilterOperator(textIndexReader, (TextMatchPredicate) predicate, numDocs);
               }
             case REGEXP_LIKE:
-              // Check if case-insensitive flag is present
-              RegexpLikePredicate regexpLikePredicate = (RegexpLikePredicate) predicate;
-              boolean caseInsensitive = regexpLikePredicate.isCaseInsensitive();
-              if (caseInsensitive) {
-                if (dataSource.getIFSTIndex() != null) {
-                  predicateEvaluator =
-                      IFSTBasedRegexpPredicateEvaluatorFactory.newIFSTBasedEvaluator(regexpLikePredicate,
-                          dataSource.getIFSTIndex(), dataSource.getDictionary());
-                } else {
-                  predicateEvaluator =
-                      PredicateEvaluatorProvider.getPredicateEvaluator(predicate, dataSource.getDictionary(),
-                          dataSource.getDataSourceMetadata().getDataType(), _queryContext);
-                }
-              } else {
-                if (dataSource.getFSTIndex() != null) {
-                  predicateEvaluator = FSTBasedRegexpPredicateEvaluatorFactory.newFSTBasedEvaluator(regexpLikePredicate,
-                      dataSource.getFSTIndex(), dataSource.getDictionary());
-                } else {
-                  predicateEvaluator =
-                      PredicateEvaluatorProvider.getPredicateEvaluator(predicate, dataSource.getDictionary(),
-                          dataSource.getDataSourceMetadata().getDataType(), _queryContext);
-                }
-              }
+              // PredicateEvaluatorProvider handles FST/IFST upgrade internally when the dictionary is usable for
+              // filtering and a matching text index exists on the data source.
+              predicateEvaluator =
+                  PredicateEvaluatorProvider.getPredicateEvaluator(predicate, dataSource, _queryContext);
               _predicateEvaluators.add(Pair.of(predicate, predicateEvaluator));
               return FilterOperatorUtils.getLeafFilterOperator(_queryContext, predicateEvaluator, dataSource, numDocs);
             case JSON_MATCH:
@@ -397,6 +375,7 @@ public class FilterPlanNode implements PlanNode {
       VectorSimilarityPredicate predicate, String column, int numDocs, boolean hasMetadataFilter) {
     VectorIndexReader vectorIndex = dataSource.getVectorIndex();
     VectorIndexConfig vectorIndexConfig = dataSource.getVectorIndexConfig();
+    boolean isMutableSegment = _indexSegment.getSegmentMetadata().isMutableSegment();
     VectorSearchParams searchParams = VectorSearchParams.fromQueryOptions(_queryContext.getQueryOptions());
 
     if (vectorIndex != null) {
@@ -418,7 +397,7 @@ public class FilterPlanNode implements PlanNode {
     Preconditions.checkState(forwardIndexReader != null,
         "Cannot apply VECTOR_SIMILARITY on column: %s -- no vector index and no forward index available", column);
     return new ExactVectorScanFilterOperator(forwardIndexReader, predicate, column, numDocs, vectorIndexConfig,
-        getVectorFallbackReason(vectorIndexConfig), searchParams);
+        getVectorFallbackReason(vectorIndexConfig, isMutableSegment), searchParams);
   }
 
   /**
@@ -593,12 +572,16 @@ public class FilterPlanNode implements PlanNode {
     }
   }
 
-  private static String getVectorFallbackReason(@Nullable VectorIndexConfig vectorIndexConfig) {
+  private static String getVectorFallbackReason(@Nullable VectorIndexConfig vectorIndexConfig,
+      boolean isMutableSegment) {
     if (vectorIndexConfig == null || vectorIndexConfig.isDisabled()) {
-      return "vector_index_missing";
+      return isMutableSegment ? "vector_index_missing_on_mutable_segment" : "vector_index_missing";
     }
-    return vectorIndexConfig.resolveBackendType().supportsMutableSegments()
-        ? "vector_index_missing"
-        : vectorIndexConfig.resolveBackendType().name().toLowerCase() + "_index_unavailable";
+    VectorBackendType backendType = vectorIndexConfig.resolveBackendType();
+    if (isMutableSegment && !backendType.supportsMutableSegments()) {
+      return backendType.name().toLowerCase() + "_mutable_segment_unavailable";
+    }
+    return backendType.supportsMutableSegments() ? "vector_index_missing"
+        : backendType.name().toLowerCase() + "_index_unavailable";
   }
 }

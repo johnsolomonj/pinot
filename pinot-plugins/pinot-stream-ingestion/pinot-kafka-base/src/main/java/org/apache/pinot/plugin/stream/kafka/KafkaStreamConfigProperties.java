@@ -41,18 +41,6 @@ public class KafkaStreamConfigProperties {
     return Joiner.on(DOT_SEPARATOR).join(StreamConfigProperties.STREAM_PREFIX, property);
   }
 
-  public static class HighLevelConsumer {
-    public static final String KAFKA_HLC_BOOTSTRAP_SERVER = "kafka.hlc.bootstrap.server";
-    public static final String KAFKA_HLC_ZK_CONNECTION_STRING = "kafka.hlc.zk.connect.string";
-    public static final String ZK_SESSION_TIMEOUT_MS = "zookeeper.session.timeout.ms";
-    public static final String ZK_CONNECTION_TIMEOUT_MS = "zookeeper.connection.timeout.ms";
-    public static final String ZK_SYNC_TIME_MS = "zookeeper.sync.time.ms";
-    public static final String REBALANCE_MAX_RETRIES = "rebalance.max.retries";
-    public static final String REBALANCE_BACKOFF_MS = "rebalance.backoff.ms";
-    public static final String AUTO_COMMIT_ENABLE = "auto.commit.enable";
-    public static final String AUTO_OFFSET_RESET = "auto.offset.reset";
-  }
-
   public static class LowLevelConsumer {
     public static final String KAFKA_BROKER_LIST = "kafka.broker.list";
     public static final String KAFKA_BUFFER_SIZE = "kafka.buffer.size";
@@ -70,8 +58,10 @@ public class KafkaStreamConfigProperties {
   public static final String KAFKA_CONSUMER_PROP_PREFIX = "kafka.consumer.prop";
 
   /**
-   * Optional comma-separated list of Kafka partition IDs to consume (e.g. "0,2,5").
+   * Optional comma-separated list of Kafka partition IDs or inclusive ranges to consume
+   * (e.g. "0,2,5" or "0-399" or "0-99,200,300-399").
    * When set, only these partitions are used for the table; when absent, all topic partitions are consumed.
+   * The total number of unique partition IDs must not exceed 10,000.
    */
   public static final String PARTITION_IDS = "kafka.partition.ids";
 }

@@ -74,9 +74,9 @@ import org.apache.pinot.segment.local.upsert.ComparisonColumns;
 import org.apache.pinot.segment.local.upsert.PartitionUpsertMetadataManager;
 import org.apache.pinot.segment.local.upsert.RecordInfo;
 import org.apache.pinot.segment.local.upsert.UpsertContext;
+import org.apache.pinot.segment.local.upsert.UpsertViewManager;
 import org.apache.pinot.segment.local.utils.FixedIntArrayOffHeapIdMap;
 import org.apache.pinot.segment.local.utils.IdMap;
-import org.apache.pinot.segment.local.utils.IngestionUtils;
 import org.apache.pinot.segment.spi.AggregationFunctionType;
 import org.apache.pinot.segment.spi.MutableSegment;
 import org.apache.pinot.segment.spi.SegmentMetadata;
@@ -148,7 +148,6 @@ public class MutableSegmentImpl implements MutableSegment {
   private final String _realtimeTableName;
   private final String _segmentName;
   private final Schema _schema;
-  private final String _timeColumnName;
   private final int _capacity;
   private final SegmentMetadata _segmentMetadata;
   private final boolean _offHeap;
@@ -209,7 +208,6 @@ public class MutableSegmentImpl implements MutableSegment {
     _realtimeTableName = config.getTableNameWithType();
     _segmentName = config.getSegmentName();
     _schema = config.getSchema();
-    _timeColumnName = config.getTimeColumnName();
     _capacity = config.getCapacity();
     SegmentZKMetadata segmentZKMetadata = config.getSegmentZKMetadata();
     _segmentMetadata = new SegmentMetadataImpl(TableNameBuilder.extractRawTableName(_realtimeTableName),
@@ -294,7 +292,7 @@ public class MutableSegmentImpl implements MutableSegment {
     // and no metrics have dictionary. If not enabled, the map returned is null.
     _recordIdMap = enableMetricsAggregationIfPossible(config);
 
-    Map<String, Pair<String, ValueAggregator>> metricsAggregators = Collections.emptyMap();
+    Map<String, Pair<String, ValueAggregator>> metricsAggregators = Map.of();
     if (_recordIdMap != null) {
       metricsAggregators = getMetricsAggregators(config);
     }
@@ -502,7 +500,7 @@ public class MutableSegmentImpl implements MutableSegment {
     } else if (CollectionUtils.isNotEmpty(segmentConfig.getIngestionAggregationConfigs())) {
       return fromAggregationConfig(segmentConfig);
     } else {
-      return Collections.emptyMap();
+      return Map.of();
     }
   }
 
@@ -515,7 +513,7 @@ public class MutableSegmentImpl implements MutableSegment {
         Maps.newHashMapWithExpectedSize(metricNames.size());
     for (String metricName : metricNames) {
       columnNameToAggregator.put(metricName, Pair.of(metricName,
-          ValueAggregatorFactory.getValueAggregator(AggregationFunctionType.SUM, Collections.emptyList())));
+          ValueAggregatorFactory.getValueAggregator(AggregationFunctionType.SUM, List.of())));
     }
     return columnNameToAggregator;
   }
@@ -577,20 +575,17 @@ public class MutableSegmentImpl implements MutableSegment {
     if (indexConfigs.getConfig(StandardIndexes.dictionary()).isEnabled()) {
       return false;
     }
-    // Earlier we didn't support noDict in consuming segments for STRING and BYTES columns.
-    // So even if the user had the column in noDictionaryColumns set in table config, we still
-    // created dictionary in consuming segments.
-    // Later on we added this support. There is a particular impact of this change on the use cases
-    // that have set noDict on their STRING dimension columns for other performance
-    // reasons and also want metricsAggregation. These use cases don't get to
-    // aggregateMetrics because the new implementation is able to honor their table config setting
-    // of noDict on STRING/BYTES. Without metrics aggregation, memory pressure increases.
-    // So to continue aggregating metrics for such cases, we will create dictionary even
-    // if the column is part of noDictionary set from table config
-    if (fieldSpec instanceof DimensionFieldSpec && isAggregateMetricsEnabled() && (dataType == STRING
-        || dataType == BYTES)) {
-      _logger.info("Aggregate metrics is enabled. Will create dictionary in consuming segment for column {} of type {}",
-          column, dataType);
+    // Metrics aggregation keys each row on the dictionary ids of the dimension and time columns (see
+    // getOrCreateDocId), so those columns must be dictionary encoded in the consuming segment even when the table
+    // config marks them as no-dictionary. The consuming-segment dictionary is a transient structure that only exists
+    // to drive the in-memory rollup; the committed segment is rebuilt from the table config (see
+    // RealtimeSegmentConverter), so the no-dictionary setting is still honored there. Metric columns are excluded:
+    // aggregated values are mutated in place in the raw forward index and must stay no-dictionary.
+    FieldSpec.FieldType fieldType = fieldSpec.getFieldType();
+    if (isAggregateMetricsEnabled() && (fieldType == FieldSpec.FieldType.DIMENSION
+        || fieldType == FieldSpec.FieldType.DATE_TIME || fieldType == FieldSpec.FieldType.TIME)) {
+      _logger.info("Metrics aggregation is enabled. Will create dictionary in consuming segment for key column: {} of "
+          + "type: {}", column, dataType);
       return false;
     }
     // So don't create dictionary if the column (1) is member of noDictionary, and (2) is single-value or multi-value
@@ -601,36 +596,12 @@ public class MutableSegmentImpl implements MutableSegment {
 
   public SegmentPartitionConfig getSegmentPartitionConfig() {
     if (_partitionColumn != null) {
-      return new SegmentPartitionConfig(Collections.singletonMap(_partitionColumn,
+      return new SegmentPartitionConfig(Map.of(_partitionColumn,
           new ColumnPartitionConfig(_partitionFunction.getName(), _partitionFunction.getNumPartitions(),
               _partitionFunction.getFunctionConfig())));
     } else {
       return null;
     }
-  }
-
-  /**
-   * Get min time from the segment, based on the time column, only used by Kafka HLC.
-   */
-  @Deprecated
-  public long getMinTime() {
-    Long minTime = IngestionUtils.extractTimeValue(_indexContainerMap.get(_timeColumnName)._minValue);
-    if (minTime != null) {
-      return minTime;
-    }
-    return Long.MAX_VALUE;
-  }
-
-  /**
-   * Get max time from the segment, based on the time column, only used by Kafka HLC.
-   */
-  @Deprecated
-  public long getMaxTime() {
-    Long maxTime = IngestionUtils.extractTimeValue(_indexContainerMap.get(_timeColumnName)._maxValue);
-    if (maxTime != null) {
-      return maxTime;
-    }
-    return Long.MIN_VALUE;
   }
 
   @Override
@@ -1251,6 +1222,27 @@ public class MutableSegmentImpl implements MutableSegment {
   }
 
   @Override
+  public boolean hasNoQueryableDocs() {
+    if (_partitionUpsertMetadataManager == null) {
+      return false;
+    }
+    UpsertViewManager viewManager = _partitionUpsertMetadataManager.getUpsertViewManager();
+    if (viewManager != null) {
+      MutableRoaringBitmap queryableDocIdsSnapshot = viewManager.getQueryableDocIdsSnapshot(this);
+      if (queryableDocIdsSnapshot != null) {
+        return queryableDocIdsSnapshot.isEmpty();
+      }
+      return false;
+    }
+    ThreadSafeMutableRoaringBitmap queryableDocIds = getQueryableDocIds();
+    if (queryableDocIds != null) {
+      return queryableDocIds.isEmpty();
+    }
+    ThreadSafeMutableRoaringBitmap validDocIds = getValidDocIds();
+    return validDocIds != null && validDocIds.isEmpty();
+  }
+
+  @Override
   public GenericRow getRecord(int docId, GenericRow reuse) {
     try (PinotSegmentRecordReader recordReader = new PinotSegmentRecordReader()) {
       recordReader.init(this);
@@ -1336,6 +1328,7 @@ public class MutableSegmentImpl implements MutableSegment {
     for (IndexContainer indexContainer : _indexContainerMap.values()) {
       indexContainer.close();
     }
+    _indexContainerMap.clear();
 
     if (_multiColumnTextIndex != null) {
       try {
@@ -1477,6 +1470,9 @@ public class MutableSegmentImpl implements MutableSegment {
     }
 
     int i = 0;
+    // Dimension and time columns form the aggregation key. They are always dictionary encoded in the consuming
+    // segment (isNoDictionaryColumn forces a dictionary on them when aggregation is enabled), so the _dictId read
+    // below is always valid. Keep this set of columns in sync with the field types forced there.
     int[] dictIds = new int[_numKeyColumns]; // dimensions + date time columns + time column.
 
     // FIXME: this for loop breaks for multi value dimensions. https://github.com/apache/pinot/issues/3867
@@ -1489,22 +1485,21 @@ public class MutableSegmentImpl implements MutableSegment {
     return _recordIdMap.put(new FixedIntArray(dictIds));
   }
 
-  /**
-   * Helper method to enable/initialize aggregation of metrics, based on following conditions:
-   * <ul>
-   *   <li> Config to enable aggregation of metrics is specified. </li>
-   *   <li> All dimensions and time are dictionary encoded. This is because an integer array containing dictionary id's
-   *        is used as key for dimensions to record Id map. </li>
-   *   <li> None of the metrics are dictionary encoded. </li>
-   *   <li> All columns should be single-valued (see https://github.com/apache/pinot/issues/3867)</li>
-   * </ul>
-   *
-   * TODO: Eliminate the requirement on dictionary encoding for dimension and metric columns.
-   *
-   * @param config Segment config.
-   *
-   * @return Map from dictionary id array to doc id, null if metrics aggregation cannot be enabled.
-   */
+  /// Enables and initializes metrics aggregation for the consuming segment when configured and feasible.
+  ///
+  /// Aggregation is enabled when all of the following hold:
+  /// - The `aggregateMetrics` flag or ingestion `aggregationConfigs` is specified.
+  /// - No metric column is dictionary encoded. Aggregated values are mutated in place in the raw forward index, so
+  ///   metrics must stay no-dictionary.
+  /// - All metric and dimension columns are single-valued (see https://github.com/apache/pinot/issues/3867).
+  ///
+  /// Dimension and time columns form the aggregation key via their dictionary ids (see [#getOrCreateDocId]), so they
+  /// must be dictionary encoded. This is not required from the caller: [#isNoDictionaryColumn] forces a dictionary on
+  /// those columns in the consuming segment whenever aggregation is enabled, even when the table config marks them as
+  /// no-dictionary. The committed segment is rebuilt from the table config, so the no-dictionary setting is still
+  /// honored there.
+  ///
+  /// Returns the map from dictionary id array to doc id, or `null` if metrics aggregation cannot be enabled.
   private IdMap<FixedIntArray> enableMetricsAggregationIfPossible(RealtimeSegmentConfig config) {
     Set<String> noDictionaryColumns =
         FieldIndexConfigsUtil.columnsWithIndexDisabled(StandardIndexes.dictionary(), config.getIndexConfigByCol());
@@ -1530,29 +1525,12 @@ public class MutableSegmentImpl implements MutableSegment {
       }
     }
 
-    // All dimension columns should be dictionary encoded.
-    // All dimension columns must be single value
+    // All dimension columns must be single value. No-dictionary dimensions are supported: isNoDictionaryColumn()
+    // forces a dictionary on them in the consuming segment so they can be used as the aggregation key.
     for (FieldSpec fieldSpec : _physicalDimensionFieldSpecs) {
-      String dimension = fieldSpec.getName();
-      if (noDictionaryColumns.contains(dimension)) {
-        _logger.warn("Metrics aggregation cannot be turned ON in presence of no-dictionary dimensions, eg: {}",
-            dimension);
-        return null;
-      }
-
       if (!fieldSpec.isSingleValueField()) {
         _logger.warn("Metrics aggregation cannot be turned ON in presence of multi-value dimension columns, eg: {}",
-            dimension);
-        return null;
-      }
-    }
-
-    // Time columns should be dictionary encoded.
-    for (String timeColumnName : _physicalTimeColumnNames) {
-      if (noDictionaryColumns.contains(timeColumnName)) {
-        _logger.warn(
-            "Metrics aggregation cannot be turned ON in presence of no-dictionary datetime/time columns, eg: {}",
-            timeColumnName);
+            fieldSpec.getName());
         return null;
       }
     }

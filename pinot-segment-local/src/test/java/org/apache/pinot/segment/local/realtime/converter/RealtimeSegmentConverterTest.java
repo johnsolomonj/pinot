@@ -50,6 +50,7 @@ import org.apache.pinot.segment.local.segment.virtualcolumn.VirtualColumnProvide
 import org.apache.pinot.segment.spi.ColumnMetadata;
 import org.apache.pinot.segment.spi.creator.SegmentVersion;
 import org.apache.pinot.segment.spi.index.DictionaryIndexConfig;
+import org.apache.pinot.segment.spi.index.ForwardIndexConfig;
 import org.apache.pinot.segment.spi.index.StandardIndexes;
 import org.apache.pinot.segment.spi.index.TextIndexConfig;
 import org.apache.pinot.segment.spi.index.column.ColumnIndexContainer;
@@ -166,6 +167,8 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
         .setCapacity(1000)
         .setAvgNumMultiValues(3)
         .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.dictionary(), DictionaryIndexConfig.DISABLED)
+        .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.forward(),
+            ForwardIndexConfig.getDefault(FieldConfig.EncodingType.RAW))
         .setIndex(Set.of(STRING_COLUMN3), StandardIndexes.dictionary(), new DictionaryIndexConfig(false, true))
         .setIndex(Set.of(STRING_COLUMN1), StandardIndexes.inverted(), IndexConfig.ENABLED)
         .setSegmentZKMetadata(getSegmentZKMetadata(segmentName))
@@ -185,7 +188,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -242,6 +245,8 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
         .setCapacity(1000)
         .setAvgNumMultiValues(3)
         .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.dictionary(), DictionaryIndexConfig.DISABLED)
+        .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.forward(),
+            ForwardIndexConfig.getDefault(FieldConfig.EncodingType.RAW))
         .setIndex(Set.of(STRING_COLUMN3), StandardIndexes.dictionary(), new DictionaryIndexConfig(false, true))
         .setIndex(Set.of(STRING_COLUMN1, LONG_COLUMN1), StandardIndexes.inverted(), IndexConfig.ENABLED)
         .setSegmentZKMetadata(getSegmentZKMetadata(segmentName))
@@ -267,7 +272,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -332,6 +337,8 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
         .setCapacity(1000)
         .setAvgNumMultiValues(3)
         .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.dictionary(), DictionaryIndexConfig.DISABLED)
+        .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.forward(),
+            ForwardIndexConfig.getDefault(FieldConfig.EncodingType.RAW))
         .setIndex(Set.of(STRING_COLUMN3), StandardIndexes.dictionary(), new DictionaryIndexConfig(false, true))
         .setIndex(Set.of(STRING_COLUMN1), StandardIndexes.inverted(), IndexConfig.ENABLED)
         .setSegmentZKMetadata(getSegmentZKMetadata(segmentName))
@@ -351,7 +358,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -408,6 +415,8 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
         .setCapacity(1000)
         .setAvgNumMultiValues(3)
         .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.dictionary(), DictionaryIndexConfig.DISABLED)
+        .setIndex(Set.of(LONG_COLUMN2), StandardIndexes.forward(),
+            ForwardIndexConfig.getDefault(FieldConfig.EncodingType.RAW))
         .setIndex(Set.of(STRING_COLUMN3), StandardIndexes.dictionary(), new DictionaryIndexConfig(false, true))
         .setIndex(Set.of(STRING_COLUMN1, LONG_COLUMN1), StandardIndexes.inverted(), IndexConfig.ENABLED)
         .setSegmentZKMetadata(getSegmentZKMetadata(segmentName))
@@ -433,7 +442,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -495,10 +504,10 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
 
   @DataProvider
   public static Object[][] optimizeDictionaryTypeParams() {
-    // Format: {optimizeDictionaryType, expectedCRC}, crc is used here to check the correct dictionary type was used
+    // Format: {optimizeDictionaryType, expectedCRC}, crc is used here to check the correct dictionary type was used.
     return new Object[][]{
-        {true, "2653526366"},
-        {false, "2948830084"},
+        {true, "145089250"},
+        {false, "2079382792"},
     };
   }
 
@@ -559,7 +568,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -648,7 +657,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
         .withLuceneNRTCachingDirectoryMaxBufferSizeMB(luceneNRTCachingDirectoryMaxBufferSizeMB)
         .withRawValueForTextIndex(rawValueForTextIndex)
         .build();
-    RealtimeSegmentConfig realtimeSegmentConfig = new RealtimeSegmentConfig.Builder()
+    RealtimeSegmentConfig.Builder realtimeSegmentConfigBuilder = new RealtimeSegmentConfig.Builder()
         .setTableNameWithType(tableNameWithType)
         .setSegmentName(segmentName)
         .setStreamName(tableNameWithType)
@@ -662,8 +671,12 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
         .setOffHeap(true)
         .setMemoryManager(new DirectMemoryManager(segmentName))
         .setStatsHistory(RealtimeSegmentStatsHistory.deserializeFrom(new File(tmpDir, "stats")))
-        .setConsumerDir(new File(tmpDir, "consumerDir").getAbsolutePath())
-        .build();
+        .setConsumerDir(new File(tmpDir, "consumerDir").getAbsolutePath());
+    if (!dictionaryIndexConfig.isEnabled()) {
+      realtimeSegmentConfigBuilder.setIndex(Set.of(STRING_COLUMN1), StandardIndexes.forward(),
+          ForwardIndexConfig.getDefault(FieldConfig.EncodingType.RAW));
+    }
+    RealtimeSegmentConfig realtimeSegmentConfig = realtimeSegmentConfigBuilder.build();
 
     // create mutable segment impl
     RealtimeLuceneTextIndexSearcherPool.init(1);
@@ -685,7 +698,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -839,7 +852,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       // Verify the converted segment metadata preserves the partition function config
       File indexDir = new File(outputDir, segmentName);
@@ -928,7 +941,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       // Verify the converted segment metadata preserves the Murmur3 function config
       File indexDir = new File(outputDir, segmentName);
@@ -1015,7 +1028,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegmentImpl, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -1136,7 +1149,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegment, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(new File(outputDir, segmentName));
 
@@ -1252,7 +1265,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegment, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(new File(outputDir, segmentName));
 
@@ -1348,7 +1361,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegment, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);
@@ -1473,7 +1486,7 @@ public class RealtimeSegmentConverterTest implements PinotBuffersAfterMethodChec
       RealtimeSegmentConverter converter =
           new RealtimeSegmentConverter(mutableSegment, segmentZKPropsConfig, outputDir.getAbsolutePath(), schema,
               tableNameWithType, tableConfig, segmentName, false);
-      converter.build(SegmentVersion.v3, null);
+      converter.build(SegmentVersion.v3);
 
       File indexDir = new File(outputDir, segmentName);
       SegmentMetadataImpl segmentMetadata = new SegmentMetadataImpl(indexDir);

@@ -22,6 +22,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -59,7 +60,7 @@ public final class VectorIndexConfigValidator {
       Arrays.asList("nlist", "trainSampleSize", "trainingSeed", "minRowsForIndex")));
 
   private static final Set<String> IVF_FLAT_EXCLUSIVE_PROPERTIES = Collections.unmodifiableSet(new HashSet<>(
-      Collections.singletonList("minRowsForIndex")));
+      List.of("minRowsForIndex")));
 
   private static final Set<String> IVF_PQ_EXCLUSIVE_PROPERTIES = Collections.unmodifiableSet(new HashSet<>(
       Arrays.asList("pqM", "pqNbits")));
@@ -138,7 +139,7 @@ public final class VectorIndexConfigValidator {
 
     VectorBackendType backendType = resolveBackendType(config);
     validateCommonFields(config);
-    validateQuantizerProperty(config);
+    validateQuantizerProperty(config, backendType);
     validateBackendSpecificProperties(config, backendType);
   }
 
@@ -175,7 +176,7 @@ public final class VectorIndexConfigValidator {
   /**
    * Validates the optional "quantizer" property, if present, is a valid {@link VectorQuantizerType}.
    */
-  private static void validateQuantizerProperty(VectorIndexConfig config) {
+  private static void validateQuantizerProperty(VectorIndexConfig config, VectorBackendType backendType) {
     Map<String, String> properties = config.getProperties();
     if (properties == null) {
       return;
@@ -186,15 +187,31 @@ public final class VectorIndexConfigValidator {
         throw new IllegalArgumentException(
             "Invalid quantizer type: '" + quantizer + "'. Supported types: FLAT, SQ8, SQ4, PQ");
       }
-      // Only FLAT (identity) quantizer is currently wired through the index build/search path.
-      // SQ8, SQ4, and PQ quantizer integration with index creators/readers is planned for a
-      // future release. Reject non-FLAT values to avoid silent no-op configs.
       VectorQuantizerType quantizerType = VectorQuantizerType.fromString(quantizer);
-      if (quantizerType != VectorQuantizerType.FLAT) {
-        throw new IllegalArgumentException(
-            "Quantizer type '" + quantizer + "' is not yet supported in the index build/search path. "
-                + "Only 'FLAT' (no quantization) is currently available. "
-                + "SQ8, SQ4, and PQ quantizer support is planned for a future release.");
+      switch (backendType) {
+        case HNSW:
+          if (quantizerType != VectorQuantizerType.FLAT) {
+            throw new IllegalArgumentException(
+                "vectorIndexType HNSW supports only quantizer='FLAT' (no quantization), got: " + quantizer);
+          }
+          break;
+        case IVF_FLAT:
+        case IVF_ON_DISK:
+          if (quantizerType == VectorQuantizerType.PQ) {
+            throw new IllegalArgumentException(
+                "vectorIndexType " + backendType + " does not support quantizer='PQ'. "
+                    + "Supported quantizers: FLAT, SQ8, SQ4");
+          }
+          break;
+        case IVF_PQ:
+          // Preserve backward compatibility: FLAT remains accepted as a no-op override.
+          if (quantizerType != VectorQuantizerType.FLAT && quantizerType != VectorQuantizerType.PQ) {
+            throw new IllegalArgumentException(
+                "vectorIndexType IVF_PQ supports quantizer='PQ' (preferred) or 'FLAT' (legacy), got: " + quantizer);
+          }
+          break;
+        default:
+          throw new IllegalArgumentException("Unsupported vector backend type: " + backendType);
       }
     }
   }

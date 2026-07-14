@@ -38,7 +38,6 @@ import it.unimi.dsi.fastutil.ints.IntComparator;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -128,6 +127,7 @@ import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.controller.ControllerJobType;
 import org.apache.pinot.spi.data.LogicalTableConfig;
 import org.apache.pinot.spi.data.Schema;
+import org.apache.pinot.spi.exception.ConfigValidationException;
 import org.apache.pinot.spi.stream.LongMsgOffset;
 import org.apache.pinot.spi.stream.PartitionGroupMetadata;
 import org.apache.pinot.spi.stream.StreamConfig;
@@ -251,7 +251,7 @@ public class PinotTableRestletResource {
       schema = _pinotHelixResourceManager.getTableSchema(tableNameWithType);
       Preconditions.checkState(schema != null, "Failed to find schema for table: %s", tableNameWithType);
 
-      TableConfigTunerUtils.applyTunerConfigs(_pinotHelixResourceManager, tableConfig, schema, Collections.emptyMap());
+      TableConfigTunerUtils.applyTunerConfigs(_pinotHelixResourceManager, tableConfig, schema, Map.of());
 
       TableConfigValidationUtils.validateTableConfig(
           tableConfig, schema, typesToSkip, _pinotHelixResourceManager, _controllerConf, _pinotTaskManager);
@@ -360,6 +360,8 @@ public class PinotTableRestletResource {
 
       _pinotHelixResourceManager.addSchema(schema, true, false);
       LOGGER.info("[copyTable] Successfully added schema for table: {}", tableName);
+      TableConfigValidationUtils.validateTableConfig(
+          realtimeTableConfig, schema, null, _pinotHelixResourceManager, _controllerConf, _pinotTaskManager);
       // Add the table with designated starting kafka offset and segment sequence number to create consuming segments
       _pinotHelixResourceManager.addTable(realtimeTableConfig, streamMetadataList);
       LOGGER.info("[copyTable] Successfully added table config: {} with designated high watermark", tableName);
@@ -374,6 +376,8 @@ public class PinotTableRestletResource {
         response.setWatermarkInductionResult(watermarkInductionResult);
       }
       return response;
+    } catch (ConfigValidationException e) {
+      throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.BAD_REQUEST, e);
     } catch (Exception e) {
       LOGGER.error("[copyTable] Error copying table: {}", tableName, e);
       throw new ControllerApplicationException(LOGGER, "Error copying table: " + e.getMessage(),
@@ -440,7 +444,7 @@ public class PinotTableRestletResource {
     if (instanceAssignmentConfigMap == null) {
       return;
     }
-    java.util.Iterator<Map.Entry<String, JsonNode>> iterator = instanceAssignmentConfigMap.fields();
+    java.util.Iterator<Map.Entry<String, JsonNode>> iterator = instanceAssignmentConfigMap.properties().iterator();
     while (iterator.hasNext()) {
       Map.Entry<String, JsonNode> entry = iterator.next();
       JsonNode instanceAssignmentConfig = entry.getValue();
@@ -1252,6 +1256,8 @@ public class PinotTableRestletResource {
       @ApiParam(value = "Name of the table", required = true) @PathParam("tableName") String tableName,
       @ApiParam(value = "OFFLINE|REALTIME") @QueryParam("type") String tableTypeStr,
       @ApiParam(value = "Columns name", allowMultiple = true) @QueryParam("columns") List<String> columns,
+      @ApiParam(value = "Include per-column compression stats in response (default false to avoid large responses)")
+      @DefaultValue("false") @QueryParam("includeColumnCompressionStats") boolean includeColumnCompressionStats,
       @Context HttpHeaders headers) {
     tableName = DatabaseUtils.translateTableName(tableName, headers);
     LOGGER.info("Received a request to fetch aggregate metadata for a table {}", tableName);
@@ -1265,9 +1271,16 @@ public class PinotTableRestletResource {
     TableConfig tableConfig = _pinotHelixResourceManager.getTableConfig(tableNameWithType);
     int numReplica = tableConfig == null ? 1 : tableConfig.getReplication();
 
+    // compressionStatsEnabled gates server-side collection; includeColumnCompressionStats controls the per-column
+    // response list.
+    boolean compressionStatsEnabled = tableConfig != null && tableConfig.getIndexingConfig() != null
+        && tableConfig.getIndexingConfig().isCompressionStatsEnabled();
+
     String segmentsMetadata;
     try {
-      JsonNode segmentsMetadataJson = getAggregateMetadataFromServer(tableNameWithType, columns, numReplica);
+      JsonNode segmentsMetadataJson =
+          getAggregateMetadataFromServer(tableNameWithType, columns, numReplica, compressionStatsEnabled,
+              includeColumnCompressionStats);
       segmentsMetadata = JsonUtils.objectToPrettyString(segmentsMetadataJson);
     } catch (InvalidConfigException e) {
       throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.BAD_REQUEST);
@@ -1288,6 +1301,8 @@ public class PinotTableRestletResource {
       @ApiParam(value = "Name of the table with type suffix", required = true) @PathParam("tableNameWithType")
       String tableNameWithType,
       @ApiParam(value = "Comma separated list of columns") @QueryParam("columns") @Nullable String columns,
+      @ApiParam(value = "Include per-column compression stats in response (default false to avoid large responses)")
+      @DefaultValue("false") @QueryParam("includeColumnCompressionStats") boolean includeColumnCompressionStats,
       @Context HttpHeaders headers) {
     tableNameWithType = DatabaseUtils.translateTableName(tableNameWithType, headers);
     LOGGER.info("Received a request to fetch aggregate metadata for a table {}", tableNameWithType);
@@ -1317,9 +1332,13 @@ public class PinotTableRestletResource {
       }
     }
 
+    boolean compressionStatsEnabled = tableConfig != null && tableConfig.getIndexingConfig() != null
+        && tableConfig.getIndexingConfig().isCompressionStatsEnabled();
+
     try {
       JsonNode segmentsMetadataJson =
-          getAggregateMetadataFromServer(existingTableNameWithType, columnsList, numReplica);
+          getAggregateMetadataFromServer(existingTableNameWithType, columnsList, numReplica,
+              compressionStatsEnabled, includeColumnCompressionStats);
       return JsonUtils.objectToPrettyString(segmentsMetadataJson);
     } catch (InvalidConfigException e) {
       throw new ControllerApplicationException(LOGGER, e.getMessage(), Response.Status.BAD_REQUEST);
@@ -1449,12 +1468,14 @@ public class PinotTableRestletResource {
    * @param numReplica num or replica for the table
    * @return aggregated metadata of the table segments
    */
-  private JsonNode getAggregateMetadataFromServer(String tableNameWithType, List<String> columns, int numReplica)
+  private JsonNode getAggregateMetadataFromServer(String tableNameWithType, List<String> columns, int numReplica,
+      boolean compressionStatsEnabled, boolean includeColumnCompressionStats)
       throws InvalidConfigException, IOException {
     TableMetadataReader tableMetadataReader =
         new TableMetadataReader(_executor, _connectionManager, _pinotHelixResourceManager);
     return tableMetadataReader.getAggregateTableMetadata(tableNameWithType, columns, numReplica,
-        _controllerConf.getServerAdminRequestTimeoutSeconds() * 1000);
+        _controllerConf.getServerAdminRequestTimeoutSeconds() * 1000, compressionStatsEnabled,
+        includeColumnCompressionStats);
   }
 
   @GET
